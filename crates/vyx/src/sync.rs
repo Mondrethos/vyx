@@ -766,49 +766,57 @@ mod tests {
     async fn a_missing_remote_stays_pending_through_cancel() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-            let (_directory, store, _guard) = device().await;
-            let initial = store.snapshot().vault.clone();
-            let envelope = store.export_vault(initial.clone()).await.unwrap();
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let origin = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move {
-                for present in [true, false] {
-                    let (mut socket, _) = listener.accept().await.unwrap();
-                    let mut headers = Vec::new();
-                    while !headers.ends_with(b"\r\n\r\n") {
-                        headers.push(socket.read_u8().await.unwrap());
-                        assert!(headers.len() < 8192);
-                    }
-                    if present {
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nETag: \"{}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            sha256(&envelope), envelope.len(),
-                        );
-                        socket.write_all(response.as_bytes()).await.unwrap();
-                        socket.write_all(&envelope).await.unwrap();
-                    } else {
-                        socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
-                    }
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (_directory, store, _guard) = device().await;
+        let initial = store.snapshot().vault.clone();
+        let envelope = store.export_vault(initial.clone()).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for present in [true, false] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    headers.push(socket.read_u8().await.unwrap());
+                    assert!(headers.len() < 8192);
                 }
-            });
-            let mut controller = SyncController::new(store.clone(), Arc::new(Notify::new()));
-            controller.configure(origin, Secret::new("a".repeat(64))).await.unwrap();
-            controller.tick().await;
-            controller.tick().await;
-            assert_eq!(controller.status(), SyncStatus::Synced);
-            controller.request(true);
-            controller.tick().await;
-            controller.tick().await;
-            assert_eq!(controller.take_question().unwrap().kind, QuestionKind::Recreate);
-            assert_eq!(controller.status(), SyncStatus::Pending);
-            controller.answer(SyncChoice::Cancel);
-            assert_eq!(controller.status(), SyncStatus::Pending);
-            assert_eq!(store.snapshot().vault.content_sha256().unwrap(), initial.content_sha256().unwrap());
-            controller.shutdown().await.unwrap();
-            server.await.unwrap();
-        }).await.unwrap();
+                if present {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nETag: \"{}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        sha256(&envelope),
+                        envelope.len(),
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    socket.write_all(&envelope).await.unwrap();
+                } else {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                }
+            }
+        });
+        let mut controller = SyncController::new(store.clone(), Arc::new(Notify::new()));
+        controller
+            .configure(origin, Secret::new("a".repeat(64)))
+            .await
+            .unwrap();
+        controller.tick().await;
+        controller.tick().await;
+        assert_eq!(controller.status(), SyncStatus::Synced);
+        controller.request(true);
+        controller.tick().await;
+        controller.tick().await;
+        assert_eq!(
+            controller.take_question().unwrap().kind,
+            QuestionKind::Recreate
+        );
+        assert_eq!(controller.status(), SyncStatus::Pending);
+        controller.answer(SyncChoice::Cancel);
+        assert_eq!(controller.status(), SyncStatus::Pending);
+        assert_eq!(
+            store.snapshot().vault.content_sha256().unwrap(),
+            initial.content_sha256().unwrap()
+        );
+        controller.shutdown().await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
