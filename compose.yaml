@@ -1,0 +1,15 @@
+services:
+  vyx-server:
+    build: .
+    command: ["serve", "--data-dir", "/data", "--listen", "0.0.0.0:8080"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - vyx-data:/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+volumes:
+  vyx-data:

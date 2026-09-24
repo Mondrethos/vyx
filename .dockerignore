@@ -1,0 +1,13 @@
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
+!crates/vyx/
+!crates/vyx/Cargo.toml
+!crates/vyx/src/
+!crates/vyx/src/**
+!crates/vyx-server/
+!crates/vyx-server/Cargo.toml
+!crates/vyx-server/src/
+!crates/vyx-server/src/**

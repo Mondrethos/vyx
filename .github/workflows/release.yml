@@ -1,0 +1,261 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate-version:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Match Cargo version to tag
+        if: github.event_name == 'push'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cargo_version="$(python3 - <<'PY'
+          import pathlib
+          import tomllib
+
+          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          print(manifest["workspace"]["package"]["version"])
+          PY
+          )"
+          expected_tag="v${cargo_version}"
+          if [[ "$RELEASE_TAG" != "$expected_tag" ]]; then
+            printf 'Release tag %s does not match Cargo workspace version %s.\n' \
+              "$RELEASE_TAG" "$cargo_version" >&2
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate-version
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset: vyx-x86_64-unknown-linux-musl
+            linux_musl: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: vyx-aarch64-unknown-linux-musl
+            linux_musl: true
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: vyx-x86_64-apple-darwin
+            linux_musl: false
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: vyx-aarch64-apple-darwin
+            linux_musl: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install native musl toolchain
+        if: matrix.linux_musl
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+          command -v musl-gcc
+
+          cargo_linker="CARGO_TARGET_${TARGET^^}_LINKER"
+          cargo_linker="${cargo_linker//-/_}"
+          cc_target="CC_${TARGET//-/_}"
+          {
+            printf '%s=%s\n' "$cargo_linker" musl-gcc
+            printf '%s=%s\n' "$cc_target" musl-gcc
+          } >> "$GITHUB_ENV"
+
+      - name: Install Rust 1.98.1
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.98.1 --profile minimal --target "$TARGET"
+          rustup override set 1.98.1
+          rustc --version
+          cargo --version
+
+      - name: Run locked workspace tests
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo test --workspace --locked --target "$TARGET"
+
+      - name: Build optimized client
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo build --package vyx --bin vyx --release --locked --target "$TARGET"
+
+      - name: Verify and stage native executable
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          binary="target/${TARGET}/release/vyx"
+          "$binary" --version
+          install -d dist
+          install -m 755 "$binary" "dist/${ASSET}"
+
+      - name: Upload native executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  assemble-release:
+    name: Assemble release assets
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out installer
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download native executables
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Build complete release bundle
+        run: |
+          set -euo pipefail
+          assets=(
+            vyx-x86_64-unknown-linux-musl
+            vyx-aarch64-unknown-linux-musl
+            vyx-x86_64-apple-darwin
+            vyx-aarch64-apple-darwin
+          )
+
+          for asset in "${assets[@]}"; do
+            test -s "release-assets/${asset}"
+          done
+
+          cp -- install.sh release-assets/install.sh
+          chmod 755 release-assets/install.sh
+          (
+            cd release-assets
+            sha256sum "${assets[@]}" > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Upload complete release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle-${{ github.ref_name }}
+          path: |
+            release-assets/vyx-x86_64-unknown-linux-musl
+            release-assets/vyx-aarch64-unknown-linux-musl
+            release-assets/vyx-x86_64-apple-darwin
+            release-assets/vyx-aarch64-apple-darwin
+            release-assets/SHA256SUMS
+            release-assets/install.sh
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish-release:
+    name: Publish complete release
+    if: github.event_name == 'push'
+    needs: assemble-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download complete release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle-${{ github.ref_name }}
+          path: release-assets
+
+      - name: Create draft, upload every asset, and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          assets=(
+            vyx-x86_64-unknown-linux-musl
+            vyx-aarch64-unknown-linux-musl
+            vyx-x86_64-apple-darwin
+            vyx-aarch64-apple-darwin
+            SHA256SUMS
+            install.sh
+          )
+          paths=()
+          for asset in "${assets[@]}"; do
+            path="release-assets/${asset}"
+            test -s "$path"
+            paths+=("$path")
+          done
+
+          if release_state="$(gh release view "$RELEASE_TAG" \
+            --repo "$REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            if [[ "$release_state" != true ]]; then
+              printf 'Release %s already exists and is not a draft.\n' "$RELEASE_TAG" >&2
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$REPOSITORY" \
+              --draft \
+              --verify-tag \
+              --generate-notes \
+              --title "$RELEASE_TAG"
+          fi
+
+          gh release upload "$RELEASE_TAG" "${paths[@]}" \
+            --repo "$REPOSITORY" --clobber
+
+          expected="$(printf '%s\n' "${assets[@]}" | LC_ALL=C sort)"
+          actual="$(gh release view "$RELEASE_TAG" --repo "$REPOSITORY" \
+            --json assets --jq '.assets[].name' | LC_ALL=C sort)"
+          if [[ "$actual" != "$expected" ]]; then
+            printf 'Draft release asset set is incomplete or unexpected; leaving it unpublished.\n' >&2
+            printf 'Expected:\n%s\nActual:\n%s\n' "$expected" "$actual" >&2
+            exit 1
+          fi
+
+          gh release edit "$RELEASE_TAG" --repo "$REPOSITORY" --draft=false
