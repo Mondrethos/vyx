@@ -1,19 +1,25 @@
 use anyhow::{Result, ensure};
 use bytes::Bytes;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyEvent, KeyEventKind};
+
+use crate::{shortcuts::{Bindings, Shortcut}, ui::catalog::RowKey};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
     Sidebar,
     Terminal,
+    /// The Vyx AI panel owns the keyboard; no key or paste reaches SSH.
+    Ai,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputMode {
     Sidebar,
     Terminal,
-    Prefix { previous: Focus },
+    Ai,
+    Search,
+    Prefix { previous: Focus, key: KeyEvent },
     Modal,
 }
 
@@ -22,6 +28,7 @@ impl InputMode {
         match focus {
             Focus::Sidebar => Self::Sidebar,
             Focus::Terminal => Self::Terminal,
+            Focus::Ai => Self::Ai,
         }
     }
 }
@@ -29,16 +36,69 @@ impl InputMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrefixAction {
     ToggleSidebar,
+    CycleLayout,
     NextSession,
     PreviousSession,
     CloseSession,
     Sync,
     Detach,
     Quit,
-    Help,
+    Shortcuts,
+    Settings,
+    Extensions,
+    AiChat,
+    AiFocus,
     LiteralPrefix,
     Cancel,
     Consume,
+}
+
+impl PrefixAction {
+    pub fn allowed_over_overlay(self) -> bool {
+        matches!(self, Self::CycleLayout | Self::Quit | Self::Shortcuts | Self::Settings | Self::Extensions | Self::Cancel | Self::Consume)
+    }
+
+    /// Whether the command can run now. The command bar dims exactly the commands that
+    /// dispatch refuses, so both decide from the same `PrefixContext`.
+    pub fn applicable(self, context: &PrefixContext) -> bool {
+        if context.quit_confirming {
+            return matches!(self, Self::Quit | Self::Cancel | Self::Consume);
+        }
+        if context.too_small {
+            return matches!(self, Self::Detach | Self::Quit | Self::Cancel | Self::Consume);
+        }
+        let over_overlay = !context.overlay
+            || self.allowed_over_overlay()
+            || (context.switch_over_dialog && matches!(self, Self::NextSession | Self::PreviousSession))
+            || (self == Self::Detach && context.detach_over_overlay);
+        over_overlay && match self {
+            Self::NextSession | Self::PreviousSession => context.sessions > 1,
+            Self::CloseSession => context.active_session,
+            Self::LiteralPrefix => context.literal_target,
+            _ => true,
+        }
+    }
+}
+
+/// Workspace state that decides which prefix commands apply, captured once per frame or
+/// keypress so rendering and dispatch agree.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PrefixContext {
+    /// The quit confirmation is open; only Quit and Cancel remain.
+    pub quit_confirming: bool,
+    /// The frame is below the minimum size; only Detach, Quit, and Cancel remain.
+    pub too_small: bool,
+    /// A menu, dialog, search, or extension surface owns the keyboard.
+    pub overlay: bool,
+    /// The open dialog lets the user switch sessions behind it.
+    pub switch_over_dialog: bool,
+    /// The current overlay may be left running while this client detaches.
+    pub detach_over_overlay: bool,
+    pub sessions: usize,
+    pub active_session: bool,
+    /// The literal prefix has a receiver: a connected active terminal that had the keyboard
+    /// before the bar opened, or the focused AI composer.
+    pub literal_target: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +113,8 @@ pub enum SidebarAction {
     Delete,
     CloseSession,
     Filter,
+    ClearFilter,
+    Inspect,
     ForgetHostKey,
     Sync,
     RetrySave,
@@ -60,75 +122,74 @@ pub enum SidebarAction {
     None,
 }
 
+impl SidebarAction {
+    /// Whether the action changes saved records or sync settings. While save durability is
+    /// uncertain these are replaced by Retry save, because the vault refuses further writes.
+    pub fn changes_saved_state(self, key: &RowKey) -> bool {
+        match self {
+            Self::Add | Self::Delete | Self::ForgetHostKey | Self::Sync => true,
+            Self::Edit => !matches!(key, RowKey::Session(_)),
+            _ => false,
+        }
+    }
+}
+
 pub fn is_key_input(key: KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
-pub fn is_ctrl_b(key: KeyEvent) -> bool {
-    key.code == KeyCode::Char('b')
-        && key.modifiers.contains(KeyModifiers::CONTROL)
-        && !key.modifiers.contains(KeyModifiers::ALT)
+pub const PREFIX_COMMANDS: &[(Shortcut, PrefixAction)] = &[
+    (Shortcut::PrefixSidebar, PrefixAction::ToggleSidebar),
+    (Shortcut::PrefixLayout, PrefixAction::CycleLayout),
+    (Shortcut::PrefixNextSession, PrefixAction::NextSession),
+    (Shortcut::PrefixPreviousSession, PrefixAction::PreviousSession),
+    (Shortcut::PrefixCloseSession, PrefixAction::CloseSession),
+    (Shortcut::PrefixSync, PrefixAction::Sync),
+    (Shortcut::PrefixDetach, PrefixAction::Detach),
+    (Shortcut::PrefixQuit, PrefixAction::Quit),
+    (Shortcut::PrefixShortcuts, PrefixAction::Shortcuts),
+    (Shortcut::PrefixSettings, PrefixAction::Settings),
+    (Shortcut::PrefixExtensions, PrefixAction::Extensions),
+    (Shortcut::PrefixAiChat, PrefixAction::AiChat),
+    (Shortcut::PrefixAiFocus, PrefixAction::AiFocus),
+    (Shortcut::PrefixLiteral, PrefixAction::LiteralPrefix),
+    (Shortcut::PrefixCancel, PrefixAction::Cancel),
+];
+
+pub fn prefix_action(key: KeyEvent, bindings: &Bindings) -> PrefixAction {
+    PREFIX_COMMANDS.iter()
+        .find_map(|&(shortcut, action)| bindings.matches(shortcut, key).then_some(action))
+        .unwrap_or(PrefixAction::Consume)
 }
 
-pub fn prefix_action(key: KeyEvent) -> PrefixAction {
-    if is_ctrl_b(key) {
-        return PrefixAction::LiteralPrefix;
-    }
-    if key.code == KeyCode::Esc {
-        return PrefixAction::Cancel;
-    }
-    if key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-    {
-        return PrefixAction::Consume;
-    }
-    match key.code {
-        KeyCode::Char('b') => PrefixAction::ToggleSidebar,
-        KeyCode::Char('n') => PrefixAction::NextSession,
-        KeyCode::Char('p') => PrefixAction::PreviousSession,
-        KeyCode::Char('x') => PrefixAction::CloseSession,
-        KeyCode::Char('s') => PrefixAction::Sync,
-        KeyCode::Char('d') => PrefixAction::Detach,
-        KeyCode::Char('q') => PrefixAction::Quit,
-        KeyCode::Char('?') => PrefixAction::Help,
-        _ => PrefixAction::Consume,
-    }
+pub fn sidebar_action(key: KeyEvent, bindings: &Bindings) -> SidebarAction {
+    [
+        (Shortcut::SidebarPrevious, SidebarAction::Previous),
+        (Shortcut::SidebarNext, SidebarAction::Next),
+        (Shortcut::SidebarCollapse, SidebarAction::Collapse),
+        (Shortcut::SidebarExpand, SidebarAction::Expand),
+        (Shortcut::SidebarActivate, SidebarAction::Activate),
+        (Shortcut::SidebarAdd, SidebarAction::Add),
+        (Shortcut::SidebarEdit, SidebarAction::Edit),
+        (Shortcut::SidebarDelete, SidebarAction::Delete),
+        (Shortcut::SidebarCloseSession, SidebarAction::CloseSession),
+        (Shortcut::SidebarSearch, SidebarAction::Filter),
+        (Shortcut::SidebarInspect, SidebarAction::Inspect),
+        (Shortcut::SidebarForgetHostKey, SidebarAction::ForgetHostKey),
+        (Shortcut::SidebarSync, SidebarAction::Sync),
+        (Shortcut::SidebarQuit, SidebarAction::Quit),
+        (Shortcut::SidebarClearFilter, SidebarAction::ClearFilter),
+    ]
+    .into_iter()
+    .find_map(|(shortcut, action)| bindings.matches(shortcut, key).then_some(action))
+    .unwrap_or(SidebarAction::None)
 }
 
-pub fn sidebar_action(key: KeyEvent) -> SidebarAction {
-    if key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-    {
-        return SidebarAction::None;
-    }
-    match key.code {
-        KeyCode::Up | KeyCode::Char('k') => SidebarAction::Previous,
-        KeyCode::Down | KeyCode::Char('j') => SidebarAction::Next,
-        KeyCode::Left => SidebarAction::Collapse,
-        KeyCode::Right => SidebarAction::Expand,
-        KeyCode::Enter => SidebarAction::Activate,
-        KeyCode::Char('a') => SidebarAction::Add,
-        KeyCode::Char('e') => SidebarAction::Edit,
-        KeyCode::Char('d') => SidebarAction::Delete,
-        KeyCode::Char('x') => SidebarAction::CloseSession,
-        KeyCode::Char('/') => SidebarAction::Filter,
-        KeyCode::Char('f') => SidebarAction::ForgetHostKey,
-        KeyCode::Char('s') => SidebarAction::Sync,
-        KeyCode::Char('r') => SidebarAction::RetrySave,
-        KeyCode::Char('q') => SidebarAction::Quit,
-        _ => SidebarAction::None,
-    }
-}
-
-pub fn is_local_scrollback(key: KeyEvent) -> Option<i32> {
-    if key.modifiers == KeyModifiers::SHIFT {
-        match key.code {
-            KeyCode::PageUp => Some(12),
-            KeyCode::PageDown => Some(-12),
-            _ => None,
-        }
+pub fn is_local_scrollback(key: KeyEvent, bindings: &Bindings) -> Option<i32> {
+    if bindings.matches(Shortcut::ScrollUp, key) {
+        Some(12)
+    } else if bindings.matches(Shortcut::ScrollDown, key) {
+        Some(-12)
     } else {
         None
     }

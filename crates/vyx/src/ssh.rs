@@ -1,3 +1,11 @@
+mod connection;
+mod check;
+#[cfg(test)]
+mod check_tests;
+use check::AuthCheck;
+pub use check::AuthNotice;
+pub use connection::{ConnectionTarget, PreparedConnection, ReconnectAuth};
+
 use std::fmt;
 use std::net::{IpAddr, Shutdown};
 use std::pin::Pin;
@@ -5,7 +13,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use bytes::Bytes;
@@ -19,7 +28,7 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::terminal::TerminalState;
-use crate::vault::{Auth, Credential, Host, KnownHost, Secret, Store, canonical_hostname};
+use crate::vault::{Auth, Credential, Host, HostAuth, KnownHost, Secret, Store, canonical_hostname};
 
 const NETWORK_DEADLINE: Duration = Duration::from_secs(15);
 const MAX_INPUT: usize = 64 * 1024;
@@ -81,6 +90,7 @@ pub struct SessionView {
     pub terminal: TerminalState,
     pub phase: SessionPhase,
     pub output_ended: bool,
+    pub auth_notice: Option<AuthNotice>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,7 +117,8 @@ pub struct PromptRequest {
 
 pub struct Session {
     pub id: Uuid,
-    pub host_id: Uuid,
+    pub host_id: Option<Uuid>,
+    pub destination: ConnectionTarget,
     pub label: String,
     pub view: Arc<Mutex<SessionView>>,
     input: mpsc::Sender<Bytes>,
@@ -118,17 +129,26 @@ pub struct Session {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+struct Login {
+    username: String,
+    auth: LoginMode,
+}
+
+enum LoginMode {
+    Standard(Auth),
+    TailscaleNone,
+}
+
 impl Session {
     #[allow(clippy::too_many_arguments)]
     pub fn connect(
-        host: Host,
-        credential: Credential,
+        prepared: PreparedConnection,
         store: Store,
         rows: u16,
         cols: u16,
         prompts: mpsc::Sender<PromptRequest>,
         dirty: Arc<Notify>,
-    ) -> Self {
+    ) -> Result<Self> {
         let id = Uuid::new_v4();
         let rows = rows.max(1);
         let cols = cols.max(1);
@@ -136,13 +156,15 @@ impl Session {
             terminal: TerminalState::new(rows, cols),
             phase: SessionPhase::Connecting,
             output_ended: false,
+            auth_notice: None,
         }));
         let (input, input_rx) = mpsc::channel(1);
         let (dimensions, dimensions_rx) = watch::channel((rows, cols));
         let (cancel, cancel_rx) = watch::channel(false);
         let visible = Arc::new(AtomicBool::new(false));
-        let host_id = host.id;
-        let label = host.label.clone();
+        let host_id = prepared.host_id;
+        let destination = prepared.target.clone();
+        let label = destination.label.clone();
 
         let task_view = Arc::clone(&view);
         let task_visible = Arc::clone(&visible);
@@ -150,8 +172,7 @@ impl Session {
         let task = tokio::spawn(async move {
             let end = run_transport(
                 id,
-                host,
-                credential,
+                prepared,
                 store,
                 task_view.clone(),
                 input_rx,
@@ -174,16 +195,17 @@ impl Session {
                     set_phase(
                         &task_view,
                         &task_dirty,
-                        SessionPhase::Error(sanitize_chrome(&message)),
+                        SessionPhase::Error(check::sanitize_text(&message, 4096)),
                     );
                 }
             }
         });
 
-        Self {
+        Ok(Self {
             id,
             host_id,
             label,
+            destination,
             view,
             input,
             dimensions,
@@ -191,7 +213,7 @@ impl Session {
             visible,
             dirty,
             task: Mutex::new(Some(task)),
-        }
+        })
     }
 
     pub async fn send(&self, bytes: Vec<u8>) -> Result<()> {
@@ -212,10 +234,14 @@ impl Session {
         self.input.try_reserve()
     }
 
-    pub fn resize(&self, rows: u16, cols: u16) {
+    pub fn resize(&self, rows: u16, cols: u16) -> bool {
         let dimensions = (rows.max(1), cols.max(1));
+        if *self.dimensions.borrow() == dimensions {
+            return false;
+        }
         self.view.lock().terminal.resize(dimensions.0, dimensions.1);
         self.dimensions.send_replace(dimensions);
+        true
     }
 
     pub fn is_live(&self) -> bool {
@@ -223,8 +249,16 @@ impl Session {
     }
 
     pub fn set_visible(&self, visible: bool) {
-        self.visible.store(visible, Ordering::Release);
-        if visible {
+        if !self.visible.swap(visible, Ordering::AcqRel) && visible {
+            self.dirty.notify_one();
+        }
+    }
+
+    pub fn cancel_unfinished_authentication(&self) {
+        let mut view = self.view.lock();
+        if matches!(view.phase, SessionPhase::Connecting | SessionPhase::Authenticating) {
+            self.cancel.send_replace(true);
+            view.auth_notice = None;
             self.dirty.notify_one();
         }
     }
@@ -318,6 +352,7 @@ enum NetworkStop {
 struct NetworkBudget {
     remaining: Duration,
     pause: watch::Receiver<bool>,
+    auth_deadline: Option<Instant>,
 }
 
 impl NetworkBudget {
@@ -329,6 +364,7 @@ impl NetworkBudget {
         Self {
             remaining: limit,
             pause,
+            auth_deadline: None,
         }
     }
 
@@ -345,11 +381,23 @@ impl NetworkBudget {
                 return Err(NetworkStop::Cancelled);
             }
 
+            if self.auth_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(NetworkStop::TimedOut);
+            }
+            let deadline = self.auth_deadline;
+            let absolute = async move {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(absolute);
             let paused = *self.pause.borrow_and_update();
             if paused {
                 tokio::select! {
                     result = future.as_mut() => return Ok(result),
                     _ = wait_cancelled(cancel) => return Err(NetworkStop::Cancelled),
+                    _ = &mut absolute => return Err(NetworkStop::TimedOut),
                     changed = self.pause.changed() => {
                         if changed.is_err() {
                             continue;
@@ -366,6 +414,7 @@ impl NetworkBudget {
             let sleep = tokio::time::sleep(self.remaining);
             tokio::pin!(sleep);
             tokio::select! {
+                _ = &mut absolute => return Err(NetworkStop::TimedOut),
                 result = future.as_mut() => {
                     self.remaining = self.remaining.saturating_sub(started.elapsed());
                     return Ok(result);
@@ -454,8 +503,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn run_transport(
     session_id: Uuid,
-    host: Host,
-    credential: Credential,
+    prepared: PreparedConnection,
     store: Store,
     view: Arc<Mutex<SessionView>>,
     input: mpsc::Receiver<Bytes>,
@@ -465,74 +513,38 @@ async fn run_transport(
     visible: Arc<AtomicBool>,
     dirty: Arc<Notify>,
 ) -> TransportEnd {
-    let hostname = match canonical_hostname(&host.hostname) {
-        Ok(hostname) => hostname,
-        Err(_) => return TransportEnd::Error("Invalid SSH hostname".to_owned()),
-    };
     let repaint = Repaint { visible, dirty };
     let (pause_tx, pause_rx) = watch::channel(false);
     let pause = PromptPause(pause_tx);
     let mut budget = NetworkBudget::new(pause_rx);
 
-    let connect = TcpStream::connect((hostname.as_str(), host.port));
-    let stream = match network_call(
-        &mut budget,
-        &mut cancel,
-        connect,
-        "Could not connect to the SSH server",
-    )
-    .await
-    {
-        Ok(stream) => stream,
-        Err(error) => return operation_end(error, "SSH connection timed out"),
+    let (stream, mut owner, tailscale_keys) = match connection::open(&prepared, &mut budget, &mut cancel).await {
+        Ok(transport) => transport,
+        Err(_) if *cancel.borrow() => return TransportEnd::Closed { status: None, signal: None },
+        Err(error) => return TransportEnd::Error(sanitize_chrome(&format!("{error:#}"))),
     };
-    if stream.set_nodelay(true).is_err() {
-        return TransportEnd::Error("Could not configure the SSH connection".to_owned());
-    }
-    let standard = match stream.into_std() {
-        Ok(stream) => stream,
-        Err(_) => {
-            return TransportEnd::Error("Could not take ownership of the SSH socket".to_owned());
-        }
-    };
-    let shutdown = match standard.try_clone() {
-        Ok(stream) => stream,
-        Err(_) => {
-            return TransportEnd::Error("Could not retain SSH cancellation ownership".to_owned());
-        }
-    };
-    let stream = match TcpStream::from_std(standard) {
-        Ok(stream) => stream,
-        Err(_) => return TransportEnd::Error("Could not initialize the SSH transport".to_owned()),
-    };
-    let cancellation_socket = match shutdown.try_clone() {
-        Ok(stream) => stream,
-        Err(_) => {
-            return TransportEnd::Error("Could not retain SSH cancellation ownership".to_owned());
-        }
-    };
-    let (stop_cancellation, mut cancellation_stopped) = oneshot::channel();
-    let mut cancellation = cancel.clone();
-    let cancellation_task = tokio::spawn(async move {
-        tokio::select! {
-            _ = wait_cancelled(&mut cancellation) => {
-                let _ = cancellation_socket.shutdown(Shutdown::Both);
-            }
-            _ = &mut cancellation_stopped => {}
-        }
-    });
+    let hostname = prepared.target.address;
+    let port = prepared.target.port;
+    let credential = prepared.login;
 
     let result = async {
         let handler_failure = Arc::new(Mutex::new(None));
+        let check = AuthCheck::new(
+            matches!(credential.auth, LoginMode::TailscaleNone),
+            view.clone(), repaint.dirty.clone(), pause.clone(), cancel.clone(),
+        );
         let handler = ClientHandler {
             session_id,
             hostname: hostname.clone(),
-            port: host.port,
+            port,
             store,
             prompts: prompts.clone(),
             cancel: cancel.clone(),
             pause: pause.clone(),
             failure: Arc::clone(&handler_failure),
+            tailscale_keys,
+            verified_tailscale_key: false,
+            check: check.clone(),
         };
         let config = Arc::new(client::Config {
             window_size: 262_144,
@@ -554,7 +566,7 @@ async fn run_transport(
                 return TransportEnd::Error(message);
             }
             Err(stop) => {
-                let _ = shutdown.shutdown(Shutdown::Both);
+                owner.shutdown().await;
                 let _ = connecting.await;
                 return match stop {
                     NetworkStop::Cancelled => TransportEnd::Closed {
@@ -582,10 +594,12 @@ async fn run_transport(
             input,
             dimensions,
             &repaint,
+            &check,
+            &handler_failure,
         )
         .await;
 
-        let _ = shutdown.shutdown(Shutdown::Both);
+        owner.shutdown().await;
         let _ = handle.await;
 
         match drive_end {
@@ -606,21 +620,10 @@ async fn run_transport(
         }
     }
     .await;
-    let _ = stop_cancellation.send(());
-    let _ = cancellation_task.await;
+    owner.shutdown().await;
     result
 }
 
-fn operation_end(error: OperationError, timeout: &'static str) -> TransportEnd {
-    match error {
-        OperationError::Cancelled => TransportEnd::Closed {
-            status: None,
-            signal: None,
-        },
-        OperationError::TimedOut => TransportEnd::Error(timeout.to_owned()),
-        OperationError::Failed(message) => TransportEnd::Error(message),
-    }
-}
 
 struct ClientHandler {
     session_id: Uuid,
@@ -631,6 +634,9 @@ struct ClientHandler {
     cancel: watch::Receiver<bool>,
     pause: PromptPause,
     failure: Arc<Mutex<Option<String>>>,
+    tailscale_keys: Option<Vec<PublicKey>>,
+    verified_tailscale_key: bool,
+    check: AuthCheck,
 }
 
 impl ClientHandler {
@@ -646,11 +652,12 @@ impl client::Handler for ClientHandler {
 
     async fn auth_banner(
         &mut self,
-        _banner: &str,
+        banner: &str,
         _session: &mut client::Session,
     ) -> std::result::Result<(), Self::Error> {
-        // Remote text is intentionally not copied into UI chrome. The terminal channel
-        // remains the only surface where untrusted server-controlled display data is parsed.
+        if self.verified_tailscale_key {
+            self.check.banner(banner).map_err(|error| self.reject(error))?;
+        }
         Ok(())
     }
 
@@ -664,6 +671,16 @@ impl client::Handler for ClientHandler {
                 return Err(self.reject("SSH host certificates are not supported"));
             }
         };
+        if let Some(expected) = &self.tailscale_keys {
+            if !expected.iter().any(|key| key.key_data() == incoming.key_data()) {
+                return Err(self.reject("Tailscale-distributed SSH host key mismatch; no trust override is permitted"));
+            }
+            self.verified_tailscale_key = true;
+            return Ok(true);
+        }
+        if self.check.is_keyless() {
+            return Err(self.reject("Tailscale SSH requires distributed host keys; no trust override is permitted"));
+        }
         let stored = self
             .store
             .snapshot()
@@ -819,7 +836,7 @@ fn auth_disposition(result: AuthResult) -> AuthDisposition {
 #[allow(clippy::too_many_arguments)]
 async fn authenticate(
     session_id: Uuid,
-    credential: &Credential,
+    credential: &Login,
     handle: &mut client::Handle<ClientHandler>,
     budget: &mut NetworkBudget,
     cancel: &mut watch::Receiver<bool>,
@@ -827,7 +844,7 @@ async fn authenticate(
     pause: &PromptPause,
 ) -> std::result::Result<(), OperationError> {
     match &credential.auth {
-        Auth::Password { password } => {
+        LoginMode::Standard(Auth::Password { password }) => {
             let result = network_call(
                 budget,
                 cancel,
@@ -850,7 +867,7 @@ async fn authenticate(
             )
             .await
         }
-        Auth::PrivateKey { pem, passphrase } => {
+        LoginMode::Standard(Auth::PrivateKey { pem, passphrase }) => {
             let key = load_private_key(
                 session_id,
                 pem.clone(),
@@ -883,17 +900,24 @@ async fn authenticate(
             )
             .await
         }
-        Auth::Agent => {
+        LoginMode::Standard(Auth::Agent) => {
             authenticate_agent(
                 session_id, credential, handle, budget, cancel, prompts, pause,
             )
             .await
         }
-        Auth::KeyboardInteractive => {
+        LoginMode::Standard(Auth::KeyboardInteractive) => {
             keyboard_interactive(
                 session_id, credential, handle, budget, cancel, prompts, pause,
             )
             .await
+        }
+        LoginMode::TailscaleNone => {
+            let result = network_call(budget, cancel, handle.authenticate_none(credential.username.clone()), "Tailscale SSH authentication failed").await?;
+            match result {
+                AuthResult::Success => Ok(()),
+                _ => Err(OperationError::failed("Tailscale SSH denied access; no credential fallback was attempted")),
+            }
         }
     }
 }
@@ -901,7 +925,7 @@ async fn authenticate(
 #[allow(clippy::too_many_arguments)]
 async fn finish_primary_auth(
     session_id: Uuid,
-    credential: &Credential,
+    credential: &Login,
     handle: &mut client::Handle<ClientHandler>,
     budget: &mut NetworkBudget,
     cancel: &mut watch::Receiver<bool>,
@@ -1022,7 +1046,7 @@ async fn rsa_hash_for(
 #[allow(clippy::too_many_arguments)]
 async fn authenticate_agent(
     session_id: Uuid,
-    credential: &Credential,
+    credential: &Login,
     handle: &mut client::Handle<ClientHandler>,
     budget: &mut NetworkBudget,
     cancel: &mut watch::Receiver<bool>,
@@ -1108,7 +1132,7 @@ async fn authenticate_agent(
 #[allow(clippy::too_many_arguments)]
 async fn keyboard_interactive(
     session_id: Uuid,
-    credential: &Credential,
+    credential: &Login,
     handle: &mut client::Handle<ClientHandler>,
     budget: &mut NetworkBudget,
     cancel: &mut watch::Receiver<bool>,
@@ -1248,7 +1272,7 @@ enum DriveEnd {
 #[allow(clippy::too_many_arguments)]
 async fn setup_and_drive(
     session_id: Uuid,
-    credential: &Credential,
+    credential: &Login,
     handle: &mut client::Handle<ClientHandler>,
     budget: &mut NetworkBudget,
     cancel: &mut watch::Receiver<bool>,
@@ -1258,12 +1282,13 @@ async fn setup_and_drive(
     input: mpsc::Receiver<Bytes>,
     mut dimensions: watch::Receiver<(u16, u16)>,
     repaint: &Repaint,
+    check: &AuthCheck,
+    handler_failure: &Mutex<Option<String>>,
 ) -> DriveEnd {
-    if let Err(error) = authenticate(
-        session_id, credential, handle, budget, cancel, prompts, pause,
-    )
-    .await
-    {
+    let authentication = check.authenticate(
+        session_id, credential, handle, budget, cancel, prompts, pause, handler_failure,
+    ).await;
+    if let Err(error) = authentication {
         return drive_operation_error(error, "SSH authentication timed out");
     }
 
@@ -1744,6 +1769,7 @@ mod tests {
             terminal: TerminalState::new(24, 80),
             phase: SessionPhase::Connected,
             output_ended: false,
+            auth_notice: None,
         }));
         let repaint = Repaint {
             visible: Arc::new(AtomicBool::new(false)),

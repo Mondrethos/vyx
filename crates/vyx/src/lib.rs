@@ -1,11 +1,17 @@
+pub mod ai;
 pub mod app;
+pub mod extensions;
 pub mod input;
 pub mod remote;
 pub mod screen;
+pub mod settings;
+pub mod shortcuts;
 pub mod ssh;
 pub mod startup;
+pub mod tailscale;
 pub mod sync;
 pub mod terminal;
+pub mod theme;
 pub mod ui;
 pub mod update;
 pub mod vault;

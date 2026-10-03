@@ -18,6 +18,8 @@ pub struct TerminalState {
     parser: vt100::Parser<TerminalCallbacks>,
     observer: OriginObserver,
     osc_filter: OscFilter,
+    /// Remote bytes processed so far; quiescence checks compare it, nothing else.
+    output_bytes: u64,
 }
 
 impl TerminalState {
@@ -33,11 +35,17 @@ impl TerminalState {
             ),
             observer: OriginObserver::new(rows),
             osc_filter: OscFilter::new(),
+            output_bytes: 0,
         }
     }
 
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
+    }
+
+    /// Total remote output processed, saturating.
+    pub fn output_bytes(&self) -> u64 {
+        self.output_bytes
     }
 
     /// Processes remote bytes and returns terminal protocol replies generated
@@ -47,7 +55,9 @@ impl TerminalState {
             parser,
             observer,
             osc_filter,
+            output_bytes,
         } = self;
+        *output_bytes = output_bytes.saturating_add(bytes.len() as u64);
         let mut replies = Vec::new();
         osc_filter.process(bytes, |filtered| {
             process_filtered(parser, observer, filtered, &mut replies);
@@ -254,6 +264,61 @@ mod tests {
         assert_eq!(
             terminal.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT)),
             None
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paste_then_enter_does_not_isolate_execution_from_pending_shell_input() {
+        use std::{fs::File, io::Write, os::fd::FromRawFd, process::Stdio, time::Duration};
+
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: openpty initializes both descriptors on success; optional pointers
+        // are null. Each returned descriptor is immediately given one owning File.
+        let result = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+        let (mut master, slave) =
+            unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+        let child = tokio::process::Command::new("/bin/sh")
+            .arg("-i")
+            .env_clear()
+            .stdin(slave)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        // A real shell, not a byte-echo fixture: a pending prefix changes the
+        // executed command despite exact text submission. Never claim isolation
+        // or try to clear input with control keys (a foreground app may own it).
+        master.write_all(b"printf 'pending:<%s>\\n' ").unwrap();
+        let terminal = TerminalState::new(24, 80);
+        master.write_all(&terminal.paste("printf smoke-safe")).unwrap();
+        master
+            .write_all(
+                &terminal
+                    .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                    .unwrap(),
+            )
+            .unwrap();
+        master.write_all(b"exit\r").unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+            .await
+            .expect("shell did not exit")
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "pending:<printf>\npending:<smoke-safe>\n"
         );
     }
 

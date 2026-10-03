@@ -22,9 +22,25 @@ case "${1-}" in
     -h|--help)
         printf '%s\n' \
             'Usage: install.sh [NATIVE_BINARY]' \
-            'Installs the latest verified Linux/macOS release into ${PREFIX:-$HOME/.local}/bin.' \
-            'VYX_VERSION=vX.Y.Z selects a specific release. An explicit binary installs a local build.' \
-            'If needed, the installer adds the bin directory to your shell startup configuration.'
+            '' \
+            'Installs the latest verified Linux/macOS release of vyx into ${PREFIX:-$HOME/.local}/bin.' \
+            'One vyx executable is installed; the installer is not needed to run it afterward.' \
+            'Built-in SSH needs no system ssh or tput; the sync server and local-agent authentication are optional.' \
+            '' \
+            'Arguments:' \
+            '  NATIVE_BINARY        Install this local vyx build instead of downloading a release.' \
+            'Environment:' \
+            '  VYX_VERSION=vX.Y.Z   Install a specific stable release instead of the latest.' \
+            '  PREFIX=DIR           Install into DIR/bin (default: $HOME/.local).' \
+            'Options:' \
+            '  -h, --help           Show this help.' \
+            '' \
+            'Examples:' \
+            '  sh install.sh' \
+            '  VYX_VERSION=v0.1.1 sh install.sh' \
+            '  PREFIX=/opt/vyx sh install.sh ./target/release/vyx' \
+            '' \
+            'Afterward, run vyx to start or reattach, or vyx SAVED_SERVER_NAME to connect (exact and case-sensitive; quote labels with spaces; vyx -- update connects to a server named update). Ctrl+B opens the command bar, Ctrl+B then d detaches, and Ctrl+B then q quits; vyx --help has the full reference. Quit an older running workspace before starting a new version. If needed, the installer adds the bin directory to your shell startup configuration.'
         exit 0
         ;;
 esac
@@ -140,4 +156,6 @@ case ":$PATH:" in
         done
         ;;
 esac
-printf '%s\n' 'Run vyx to start or reattach. Ctrl+B then d detaches; Ctrl+B then q quits.' 'Run vyx update to install future releases.'
+printf '%s\n' 'Run vyx to start or reattach; vyx update installs later releases.' \
+    'If an older vyx workspace is running, quit it (Ctrl+B then q) before starting this version; detaching keeps the old code running.' \
+    'Settings: Ctrl+B then , · Shortcuts: Ctrl+B then ? · Full reference: vyx --help'

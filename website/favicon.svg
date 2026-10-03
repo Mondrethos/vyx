@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12">
+  <!-- The V from Vyx's block logo: 1:2 terminal cells, yellow on the sunk background. -->
+  <rect width="12" height="12" rx="2" fill="#1d2021"/>
+  <g transform="translate(2.5 1)" fill="#fabd2f">
+    <rect x="0" y="0" width="2" height="4"/><rect x="5" y="0" width="2" height="4"/>
+    <rect x="1" y="4" width="2" height="4"/><rect x="4" y="4" width="2" height="4"/>
+    <rect x="2" y="8" width="3" height="2"/>
+  </g>
+</svg>

@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 1,
+  "id": "com.vyx.tailscale",
+  "name": "Tailscale devices",
+  "description": "Browse local Tailscale peers and explicitly review connections or save individual servers in Vyx.",
+  "version": "0.1.0",
+  "permissions": ["tailscale.read", "connections.propose", "hosts.propose"],
+  "commands": [{
+    "id": "browse",
+    "title": "Browse Tailscale devices",
+    "description": "Search devices, inspect metadata, and choose keyless Tailscale SSH or ordinary SSH over Tailscale."
+  }]
+}

@@ -9,20 +9,23 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::{
-    crypto::{Crypto, MAX_ENVELOPE},
+    crypto::{Crypto, MAX_ENVELOPE, MAX_RECOVERY_FILE},
     model::{LocalState, Secret, SyncState, Vault},
 };
 
 const STATE_FILE: &str = "state.vyx";
 const LOCK_FILE: &str = ".lock";
 const CONFLICTS_DIRECTORY: &str = "conflicts";
+const RECOVERY_LOCAL_ONLY: &str =
+    "Recovery is available only for local-only vaults; synchronized vaults cannot be reset here.";
+const RECOVERY_SAVE_WARNING: &str = "Recovery file saved, but durability could not be confirmed. Keep another verified copy before relying on it.";
 
 type StoreEdit = Box<dyn FnOnce(&mut LocalState) -> Result<()> + Send + 'static>;
 
@@ -117,6 +120,10 @@ impl Directory {
     }
 
     pub fn read_envelope(&self) -> Result<Vec<u8>> {
+        #[cfg(test)]
+        if consume_fault(&self.faults.fail_envelope_read) {
+            bail!("injected encrypted state read failure");
+        }
         read_bounded_regular_file(&self.state_path(), MAX_ENVELOPE)
             .context("read encrypted local state")
     }
@@ -133,11 +140,8 @@ impl Directory {
             }
 
             let crypto = Crypto::create(&passphrase).context("create vault identity")?;
-            let mut state = LocalState {
-                vault: Vault::new(),
-                sync: None,
-            };
-            state.vault.normalize();
+            let mut state = LocalState::new(Vault::new(), None);
+            state.normalize();
             state.validate()?;
             let envelope = crypto.encrypt_local(&state)?;
             let outcome = atomic_install_new(&directory, &directory.state_path(), &envelope)?;
@@ -158,7 +162,7 @@ impl Directory {
             let mut state = crypto
                 .decrypt_local(&envelope)
                 .context("decrypt local state")?;
-            state.vault.normalize();
+            state.normalize();
             state.validate()?;
             File::open(directory.state_path())?
                 .sync_all()
@@ -176,6 +180,39 @@ impl Directory {
         .await
         .context("vault unlock worker stopped")??;
 
+        Ok(Store::start(initialized))
+    }
+
+    pub async fn recover(self: &Arc<Self>, file: PathBuf, new: Secret) -> Result<Store> {
+        let directory = Arc::clone(self);
+        let initialized = tokio::task::spawn_blocking(move || {
+            let initialization = directory
+                .initialization
+                .lock()
+                .map_err(|_| anyhow!("vault initialization lock is poisoned"))?;
+            let envelope = directory.read_envelope()?;
+            let recovery = read_recovery_file(&file)?;
+            let (_, state) = Crypto::recover_local(&envelope, &recovery)?;
+            ensure!(state.sync.is_none(), RECOVERY_LOCAL_ONLY);
+            ensure!(
+                new.expose().chars().count() >= 16,
+                "New passphrase must contain at least 16 characters"
+            );
+            let crypto = Crypto::create(&new).context("create replacement vault identity")?;
+            let envelope = crypto.encrypt_local(&state)?;
+            let outcome = atomic_replace(&directory, &directory.state_path(), &envelope)?;
+            drop(initialization);
+            // The authenticated state is already known. Never reread after committing a reset:
+            // an IO failure here must not turn installed credentials into an ordinary failure.
+            Ok::<_, anyhow::Error>(InitializedStore {
+                directory,
+                crypto,
+                state,
+                uncertain: matches!(outcome, AtomicWrite::Uncertain(_)),
+            })
+        })
+        .await
+        .context("vault recovery worker stopped")??;
         Ok(Store::start(initialized))
     }
 
@@ -212,7 +249,7 @@ impl Directory {
                     sync.base_content_sha256 = Some(vault.content_sha256()?);
                 }
             }
-            let state = LocalState { vault, sync };
+            let state = LocalState::new(vault, sync);
             state.validate()?;
             let local_envelope = crypto.encrypt_local(&state)?;
             let outcome = atomic_install_new(&directory, &directory.state_path(), &local_envelope)?;
@@ -242,6 +279,14 @@ impl Directory {
         self.faults.maybe_fail_before_rename()?;
         Ok(())
     }
+
+    fn sync_recovery_directory(&self, path: &Path) -> Result<()> {
+        #[cfg(test)]
+        if consume_fault(&self.faults.fail_recovery_directory_sync) {
+            bail!("injected recovery directory sync failure");
+        }
+        sync_directory_path(path)
+    }
 }
 
 struct InitializedStore {
@@ -269,7 +314,7 @@ fn initialize_after_write(
             let mut actual = crypto
                 .decrypt_local(&envelope)
                 .context("reload local state after uncertain directory sync")?;
-            actual.vault.normalize();
+            actual.normalize();
             actual.validate()?;
             Ok(InitializedStore {
                 directory,
@@ -309,15 +354,29 @@ impl Store {
 
         tokio::spawn(async move {
             while let Some(command) = receiver.recv().await {
-                let writer = Arc::clone(&writer);
-                let _ = tokio::task::spawn_blocking(move || {
-                    let result = writer.lock();
-                    match result {
-                        Ok(mut writer) => writer.execute(command),
-                        Err(_) => command.fail(anyhow!("vault writer lock is poisoned")),
+                match command {
+                    Command::Shutdown { result } => {
+                        receiver.close();
+                        drop(receiver);
+                        let destroyed = tokio::task::spawn_blocking(move || drop(writer))
+                            .await
+                            .context("vault writer shutdown worker stopped")
+                            .map(|()| ());
+                        let _ = result.send(destroyed);
+                        return;
                     }
-                })
-                .await;
+                    command => {
+                        let writer = Arc::clone(&writer);
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let result = writer.lock();
+                            match result {
+                                Ok(mut writer) => writer.execute(command),
+                                Err(_) => command.fail(anyhow!("vault writer lock is poisoned")),
+                            }
+                        })
+                        .await;
+                    }
+                }
             }
         });
 
@@ -345,6 +404,58 @@ impl Store {
 
     pub fn is_uncertain(&self) -> bool {
         self.core.uncertain.load(Ordering::Acquire)
+    }
+
+    pub async fn verify_passphrase(&self, passphrase: Secret) -> Result<()> {
+        let (result, response) = oneshot::channel();
+        self.core
+            .commands
+            .send(Command::VerifyPassphrase { passphrase, result })
+            .map_err(|_| anyhow!("vault writer is unavailable"))?;
+        response.await.context("vault writer stopped")?
+    }
+
+    pub async fn change_passphrase(
+        &self,
+        current: Secret,
+        new: Secret,
+    ) -> Result<Option<String>> {
+        let (result, response) = oneshot::channel();
+        self.core
+            .commands
+            .send(Command::ChangePassphrase {
+                current,
+                new,
+                result,
+            })
+            .map_err(|_| anyhow!("vault writer is unavailable"))?;
+        response.await.context("vault writer stopped")?
+    }
+
+    pub async fn save_recovery_file(
+        &self,
+        current: Secret,
+        destination: PathBuf,
+    ) -> Result<Option<String>> {
+        let (result, response) = oneshot::channel();
+        self.core
+            .commands
+            .send(Command::SaveRecoveryFile {
+                current,
+                destination,
+                result,
+            })
+            .map_err(|_| anyhow!("vault writer is unavailable"))?;
+        response.await.context("vault writer stopped")?
+    }
+
+    pub async fn recover_passphrase(&self, file: PathBuf, new: Secret) -> Result<Option<String>> {
+        let (result, response) = oneshot::channel();
+        self.core
+            .commands
+            .send(Command::RecoverPassphrase { file, new, result })
+            .map_err(|_| anyhow!("vault writer is unavailable"))?;
+        response.await.context("vault writer stopped")?
     }
 
     pub async fn commit<F>(&self, vault_changed: bool, edit: F) -> Result<Arc<LocalState>>
@@ -377,6 +488,15 @@ impl Store {
         self.core
             .commands
             .send(Command::Drain { result })
+            .map_err(|_| anyhow!("vault writer is unavailable"))?;
+        response.await.context("vault writer stopped")?
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        let (result, response) = oneshot::channel();
+        self.core
+            .commands
+            .send(Command::Shutdown { result })
             .map_err(|_| anyhow!("vault writer is unavailable"))?;
         response.await.context("vault writer stopped")?
     }
@@ -418,10 +538,32 @@ enum Command {
         edit: StoreEdit,
         result: oneshot::Sender<Result<Arc<LocalState>>>,
     },
+    VerifyPassphrase {
+        passphrase: Secret,
+        result: oneshot::Sender<Result<()>>,
+    },
+    ChangePassphrase {
+        current: Secret,
+        new: Secret,
+        result: oneshot::Sender<Result<Option<String>>>,
+    },
+    SaveRecoveryFile {
+        current: Secret,
+        destination: PathBuf,
+        result: oneshot::Sender<Result<Option<String>>>,
+    },
+    RecoverPassphrase {
+        file: PathBuf,
+        new: Secret,
+        result: oneshot::Sender<Result<Option<String>>>,
+    },
     RetrySave {
         result: oneshot::Sender<Result<()>>,
     },
     Drain {
+        result: oneshot::Sender<Result<()>>,
+    },
+    Shutdown {
         result: oneshot::Sender<Result<()>>,
     },
     ExportVault {
@@ -444,7 +586,15 @@ impl Command {
             Self::Commit { result, .. } => {
                 let _ = result.send(Err(error));
             }
-            Self::RetrySave { result } | Self::Drain { result } => {
+            Self::VerifyPassphrase { result, .. }
+            | Self::RetrySave { result }
+            | Self::Drain { result }
+            | Self::Shutdown { result } => {
+                let _ = result.send(Err(error));
+            }
+            Self::ChangePassphrase { result, .. }
+            | Self::SaveRecoveryFile { result, .. }
+            | Self::RecoverPassphrase { result, .. } => {
                 let _ = result.send(Err(error));
             }
             Self::ExportVault { result, .. } => {
@@ -478,11 +628,34 @@ impl Writer {
             } => {
                 let _ = result.send(self.commit(vault_changed, edit));
             }
+            Command::VerifyPassphrase { passphrase, result } => {
+                let _ = result.send(self.verify_passphrase(passphrase));
+            }
+            Command::ChangePassphrase {
+                current,
+                new,
+                result,
+            } => {
+                let _ = result.send(self.change_passphrase(current, new));
+            }
+            Command::SaveRecoveryFile {
+                current,
+                destination,
+                result,
+            } => {
+                let _ = result.send(self.save_recovery_file(current, destination));
+            }
+            Command::RecoverPassphrase { file, new, result } => {
+                let _ = result.send(self.recover_passphrase(file, new));
+            }
             Command::RetrySave { result } => {
                 let _ = result.send(self.retry_save());
             }
             Command::Drain { result } => {
                 let _ = result.send(Ok(()));
+            }
+            Command::Shutdown { result } => {
+                let _ = result.send(Err(anyhow!("vault writer shutdown was not intercepted")));
             }
             Command::ExportVault { vault, result } => {
                 let _ = result.send(self.export_vault(vault));
@@ -492,6 +665,111 @@ impl Writer {
             }
             Command::PreserveConflict { vault, result } => {
                 let _ = result.send(self.preserve_conflict(vault));
+            }
+        }
+    }
+
+    fn verify_passphrase(&self, passphrase: Secret) -> Result<()> {
+        let envelope = self.directory.read_envelope()?;
+        self.crypto
+            .verify_passphrase(&envelope, &passphrase)
+            .context("verify vault passphrase")
+    }
+
+    fn change_passphrase(&mut self, current: Secret, new: Secret) -> Result<Option<String>> {
+        self.verify_passphrase(current)?;
+        self.replace_passphrase(new)
+    }
+
+    fn save_recovery_file(&self, current: Secret, destination: PathBuf) -> Result<Option<String>> {
+        self.verify_passphrase(current)?;
+        self.require_local_recovery()?;
+        let parent = recovery_destination_parent(&self.directory, &destination)?;
+        let destination = parent.join(destination.file_name().context("Missing recovery filename")?);
+        ensure!(
+            fs::symlink_metadata(&destination).is_err(),
+            "refusing to overwrite existing file: {}",
+            destination.display()
+        );
+        let envelope = self.directory.read_envelope()?;
+        let state = self.crypto.decrypt_local(&envelope)?;
+        ensure!(state.sync.is_none(), RECOVERY_LOCAL_ONLY);
+        ensure!(
+            state == *self.current,
+            "On-disk vault does not match the active vault"
+        );
+        let recovery = self.crypto.export_recovery(state.vault.id)?;
+        let staged = stage_file(&parent, ".vyx-recovery.tmp-", &recovery)?;
+        let verified = read_recovery_file(staged.path())?;
+        let (candidate, recovered) = Crypto::recover_local(&envelope, &verified)?;
+        ensure!(
+            candidate.same_identity(&self.crypto) && recovered == state,
+            "Recovery file verification failed"
+        );
+        self.directory.maybe_fail_before_rename()?;
+        match staged.persist_noclobber(&destination) {
+            Ok(_file) => {}
+            Err(error) => {
+                return Err(error.error)
+                    .with_context(|| format!("install recovery file {}", destination.display()));
+            }
+        }
+        Ok(self
+            .directory
+            .sync_recovery_directory(&parent)
+            .err()
+            .map(|_| RECOVERY_SAVE_WARNING.to_owned()))
+    }
+
+    fn require_local_recovery(&self) -> Result<()> {
+        ensure!(self.current.sync.is_none(), RECOVERY_LOCAL_ONLY);
+        ensure!(
+            !self.uncertain.load(Ordering::Acquire),
+            "Save durability uncertain; Retry save before using recovery"
+        );
+        Ok(())
+    }
+
+    fn recover_passphrase(&mut self, file: PathBuf, new: Secret) -> Result<Option<String>> {
+        self.require_local_recovery()?;
+        let envelope = self.directory.read_envelope()?;
+        let recovery = read_recovery_file(&file)?;
+        let (candidate, state) = Crypto::recover_local(&envelope, &recovery)?;
+        ensure!(state.sync.is_none(), RECOVERY_LOCAL_ONLY);
+        ensure!(
+            state.vault.id == self.current.vault.id
+                && candidate.wrapped_identity() == self.crypto.wrapped_identity()
+                && candidate.same_identity(&self.crypto),
+            "Recovery file does not unlock this vault"
+        );
+        self.replace_passphrase(new)
+    }
+
+    fn replace_passphrase(&mut self, new: Secret) -> Result<Option<String>> {
+        ensure!(
+            new.expose().chars().count() >= 16,
+            "New passphrase must contain at least 16 characters"
+        );
+        if self.current.sync.is_some() {
+            bail!("Disable sync before changing the vault passphrase");
+        }
+        if self.uncertain.load(Ordering::Acquire) {
+            bail!("Save durability uncertain; Retry save before changing the vault passphrase");
+        }
+
+        let crypto = Crypto::create(&new).context("create replacement vault identity")?;
+        let envelope = crypto.encrypt_local(&self.current)?;
+        match atomic_replace(&self.directory, &self.directory.state_path(), &envelope)? {
+            AtomicWrite::Durable => {
+                self.crypto = crypto;
+                Ok(None)
+            }
+            AtomicWrite::Uncertain(sync_error) => {
+                self.crypto = crypto;
+                self.uncertain.store(true, Ordering::Release);
+                Ok(Some(format!(
+                    "Passphrase changed, but its durability is uncertain ({sync_error:#}); Retry save before closing vyx"
+                )))
             }
         }
     }
@@ -506,7 +784,10 @@ impl Writer {
         if vault_changed {
             next.vault.snapshot_id = Uuid::new_v4();
         }
-        next.vault.normalize();
+        // AI history is device-local: retention and storage caps apply on every save, and
+        // temporary conversations are dropped by `normalize` before anything is encrypted.
+        next.ai.prune_history(crate::ai::now());
+        next.normalize();
         next.validate()?;
         let envelope = self.crypto.encrypt_local(&next)?;
 
@@ -613,7 +894,7 @@ impl Writer {
             .crypto
             .decrypt_local(&envelope)
             .context("reload encrypted local state")?;
-        actual.vault.normalize();
+        actual.normalize();
         actual.validate()?;
         Ok(Arc::new(actual))
     }
@@ -717,6 +998,10 @@ fn atomic_replace(directory: &Directory, path: &Path, bytes: &[u8]) -> Result<At
                 .with_context(|| format!("replace encrypted state {}", path.display()));
         }
     }
+    #[cfg(test)]
+    if consume_fault(&directory.faults.fail_read_after_replace) {
+        directory.faults.fail_envelope_read.fetch_add(1, Ordering::Relaxed);
+    }
     match directory.sync() {
         Ok(()) => Ok(AtomicWrite::Durable),
         Err(error) => Ok(AtomicWrite::Uncertain(error)),
@@ -725,7 +1010,7 @@ fn atomic_replace(directory: &Directory, path: &Path, bytes: &[u8]) -> Result<At
 
 fn stage_file(directory: &Path, prefix: &str, bytes: &[u8]) -> Result<NamedTempFile> {
     if bytes.len() > MAX_ENVELOPE {
-        bail!("encrypted envelope exceeds the {MAX_ENVELOPE}-byte limit");
+        bail!("staged file exceeds the {MAX_ENVELOPE}-byte limit");
     }
     let mut staged = TempFileBuilder::new()
         .prefix(prefix)
@@ -735,13 +1020,17 @@ fn stage_file(directory: &Path, prefix: &str, bytes: &[u8]) -> Result<NamedTempF
         .as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))
         .context("secure staged file")?;
+    ensure!(
+        staged.as_file().metadata()?.permissions().mode() & 0o777 == 0o600,
+        "staged file permissions are not private"
+    );
     staged
         .write_all(bytes)
-        .context("write staged encrypted data")?;
+        .context("write staged data")?;
     staged
         .as_file()
         .sync_all()
-        .context("sync staged encrypted data")?;
+        .context("sync staged data")?;
     Ok(staged)
 }
 fn cleanup_staged_files(directory: &Path, prefix: &str) -> Result<bool> {
@@ -769,6 +1058,64 @@ fn cleanup_staged_files(directory: &Path, prefix: &str) -> Result<bool> {
         removed = true;
     }
     Ok(removed)
+}
+
+fn recovery_destination_parent(directory: &Directory, destination: &Path) -> Result<PathBuf> {
+    ensure!(destination.is_absolute(), "Recovery file path must be absolute");
+    ensure!(destination.file_name().is_some(), "Missing recovery filename");
+    ensure!(
+        fs::symlink_metadata(destination).is_err(),
+        "refusing to overwrite existing file: {}",
+        destination.display()
+    );
+    let parent = destination
+        .parent()
+        .context("Missing recovery file parent")?
+        .canonicalize()
+        .context("resolve recovery file parent directory")?;
+    ensure!(parent.is_dir(), "Recovery file parent is not a directory");
+    let vault = directory.path().canonicalize().context("resolve vault directory")?;
+    ensure!(
+        !parent.starts_with(vault),
+        "Recovery file must be outside the vault directory"
+    );
+    Ok(parent)
+}
+
+fn read_recovery_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("open recovery file {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect recovery file {}", path.display()))?;
+    ensure!(metadata.is_file(), "Recovery path is not a regular file");
+    ensure!(
+        metadata.len() <= MAX_RECOVERY_FILE as u64,
+        "Recovery file exceeds the {MAX_RECOVERY_FILE}-byte limit"
+    );
+    // Read into a fixed allocation that is zeroized even after a partial IO failure.
+    // The extra byte detects growth beyond the limit after the metadata check.
+    let mut bytes = Zeroizing::new(vec![0; MAX_RECOVERY_FILE + 1]);
+    let mut length = 0;
+    while length < bytes.len() {
+        match file.read(&mut bytes[length..]) {
+            Ok(0) => break,
+            Ok(count) => length += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("read recovery file {}", path.display()));
+            }
+        }
+    }
+    bytes.truncate(length);
+    ensure!(
+        bytes.len() <= MAX_RECOVERY_FILE,
+        "Recovery file exceeds the {MAX_RECOVERY_FILE}-byte limit"
+    );
+    Ok(bytes)
 }
 
 fn read_bounded_regular_file(path: &Path, maximum: usize) -> Result<Vec<u8>> {
@@ -819,6 +1166,9 @@ enum AtomicWrite {
 struct TestFaults {
     fail_before_rename: std::sync::atomic::AtomicUsize,
     fail_directory_sync: std::sync::atomic::AtomicUsize,
+    fail_recovery_directory_sync: std::sync::atomic::AtomicUsize,
+    fail_read_after_replace: std::sync::atomic::AtomicUsize,
+    fail_envelope_read: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -829,6 +1179,14 @@ impl TestFaults {
 
     fn fail_directory_sync_once(&self) {
         self.fail_directory_sync.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn fail_recovery_directory_sync_once(&self) {
+        self.fail_recovery_directory_sync.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn fail_read_after_replace_once(&self) {
+        self.fail_read_after_replace.fetch_add(1, Ordering::Relaxed);
     }
 
     fn maybe_fail_before_rename(&self) -> Result<()> {
@@ -861,9 +1219,407 @@ mod tests {
 
     use super::*;
     use crate::vault::model::Category;
+    use crate::ai::{AiData, Conversation, Message, Profile, ProviderKind, Role, Usage};
 
     fn passphrase() -> Secret {
         Secret::new("sixteen character test passphrase")
+    }
+
+    fn replacement_passphrase() -> Secret {
+        Secret::new("replacement passphrase for tests")
+    }
+
+    fn ai_data() -> AiData {
+        let mut data = AiData::default();
+        let mut profile = Profile::new(ProviderKind::OpenAi);
+        profile.credential = Some(Secret::new("local-only-ai-api-key"));
+        profile.temperature = Some(0.8455124082255701);
+        let mut conversation = Conversation::new(Some(&profile), false);
+        conversation.push(Message::new(Role::User, "local-only-chat-history")).unwrap();
+        let mut answer = Message::new(Role::Assistant, "retained answer");
+        answer.usage = Some(Usage { input_tokens: 30, output_tokens: 20, cost_usd: Some(0.01) });
+        conversation.push(answer).unwrap();
+        data.put_profile(profile).unwrap();
+        data.conversations.push(conversation);
+        data
+    }
+
+    async fn populated_store(directory: &Arc<Directory>) -> Store {
+        use crate::vault::model::{
+            Auth, Credential, Host, HostAuth, HostTransport, KnownHost, Snippet,
+        };
+
+        let store = directory.create(passphrase()).await.unwrap();
+        store
+            .commit(true, |state| {
+                state.vault.categories.push(Category {
+                    id: Uuid::from_u128(1),
+                    label: "production".into(),
+                    parent_id: None,
+                });
+                state.vault.credentials.push(Credential {
+                    id: Uuid::from_u128(2),
+                    label: "saved credential".into(),
+                    username: "test".into(),
+                    auth: Auth::Password {
+                        password: Secret::new("retained credential secret"),
+                    },
+                });
+                state.vault.hosts.push(Host {
+                    id: Uuid::from_u128(3),
+                    label: "saved server".into(),
+                    hostname: "127.0.0.1".into(),
+                    port: 2222,
+                    category_id: Some(Uuid::from_u128(1)),
+                    transport: HostTransport::Direct,
+                    auth: HostAuth::Credential {
+                        credential_id: Uuid::from_u128(2),
+                    },
+                });
+                state.vault.snippets.push(Snippet {
+                    id: Uuid::from_u128(4),
+                    label: "saved snippet".into(),
+                    command: "printf recovery-content".into(),
+                });
+                state.vault.known_hosts.push(KnownHost {
+                    hostname: "127.0.0.1".into(),
+                    port: 2222,
+                    public_key_openssh: "ssh-ed25519 retained-test-key".into(),
+                });
+                state.ai = ai_data();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_reset_preserves_state_and_rotates_credentials() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temporary.path().join("vault")).unwrap();
+        let store = populated_store(&directory).await;
+        let recovery_path = temporary.path().join("emergency.recovery");
+        store.save_recovery_file(passphrase(), recovery_path.clone()).await.unwrap();
+        let recovery = read_recovery_file(&recovery_path).unwrap();
+        // An ordinary save does not rotate the exported identity.
+        let saved = store.commit(true, |state| {
+            state.vault.snippets[0].command = "printf modified-after-export".into();
+            Ok(())
+        }).await.unwrap();
+        let historical_envelope = directory.read_envelope().unwrap();
+        assert_eq!(
+            Crypto::recover_local(&historical_envelope, &recovery).unwrap().1,
+            *saved
+        );
+        store.shutdown().await.unwrap();
+
+        let reset = directory.recover(recovery_path.clone(), replacement_passphrase()).await.unwrap();
+        assert_eq!(reset.snapshot().as_ref(), saved.as_ref());
+        reset.shutdown().await.unwrap();
+        assert!(directory.unlock(passphrase()).await.is_err());
+        let reset = directory.unlock(replacement_passphrase()).await.unwrap();
+        assert_eq!(reset.snapshot().as_ref(), saved.as_ref());
+        assert!(Crypto::recover_local(&directory.read_envelope().unwrap(), &recovery).is_err());
+        let historical = Crypto::unlock(&historical_envelope, &passphrase()).unwrap();
+        assert_eq!(historical.decrypt_local(&historical_envelope).unwrap(), *saved);
+        assert_eq!(Crypto::recover_local(&historical_envelope, &recovery).unwrap().1, *saved);
+
+        let next_path = temporary.path().join("replacement.recovery");
+        reset.save_recovery_file(replacement_passphrase(), next_path.clone()).await.unwrap();
+        let next_recovery = read_recovery_file(&next_path).unwrap();
+        assert_eq!(
+            Crypto::recover_local(&directory.read_envelope().unwrap(), &next_recovery).unwrap().1,
+            *saved
+        );
+        let retained = reset.snapshot();
+        let mut subscription = reset.subscribe();
+        assert_eq!(reset.recover_passphrase(next_path, passphrase()).await.unwrap(), None);
+        // Recovery retains the very same in-memory snapshot and watch stream.
+        assert!(Arc::ptr_eq(&retained, &reset.snapshot()));
+        assert!(!subscription.has_changed().unwrap());
+        assert_eq!(subscription.borrow_and_update().as_ref(), saved.as_ref());
+        reset.verify_passphrase(passphrase()).await.unwrap();
+        assert!(reset.verify_passphrase(replacement_passphrase()).await.is_err());
+        assert!(Crypto::recover_local(&directory.read_envelope().unwrap(), &next_recovery).is_err());
+        reset.shutdown().await.unwrap();
+        let reopened = directory.unlock(passphrase()).await.unwrap();
+        assert_eq!(reopened.snapshot().as_ref(), saved.as_ref());
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_export_refuses_clobber_and_unsafe_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temporary.path().join("vault")).unwrap();
+        let store = directory.create(passphrase()).await.unwrap();
+        let original = directory.read_envelope().unwrap();
+        let regular = temporary.path().join("existing");
+        fs::write(&regular, b"existing file contents").unwrap();
+        let folder = temporary.path().join("folder");
+        fs::create_dir(&folder).unwrap();
+        let link = temporary.path().join("link");
+        symlink(&regular, &link).unwrap();
+        let dangling = temporary.path().join("dangling");
+        symlink(temporary.path().join("missing-target"), &dangling).unwrap();
+        let alias = temporary.path().join("vault-alias");
+        symlink(directory.path(), &alias).unwrap();
+        let wrong_password = temporary.path().join("wrong-password.recovery");
+        assert!(store.save_recovery_file(Secret::new("wrong passphrase"), wrong_password.clone()).await.is_err());
+        assert!(!wrong_password.exists());
+        for destination in [
+            PathBuf::new(),
+            PathBuf::from("relative.recovery"),
+            directory.path().join("inside.recovery"),
+            alias.join("inside.recovery"),
+            temporary.path().join("missing-parent/emergency.recovery"),
+            regular.clone(),
+            folder.clone(),
+            link.clone(),
+            dangling.clone(),
+        ] {
+            assert!(store.save_recovery_file(passphrase(), destination).await.is_err());
+            assert_eq!(directory.read_envelope().unwrap(), original);
+            assert_eq!(fs::read(&regular).unwrap(), b"existing file contents");
+        }
+        assert!(folder.is_dir());
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(&dangling).unwrap().file_type().is_symlink());
+        assert!(!directory.path().join("inside.recovery").exists());
+        assert!(!temporary.path().join("missing-parent").exists());
+        let recovery_path = temporary.path().join("valid.recovery");
+        store.save_recovery_file(passphrase(), recovery_path.clone()).await.unwrap();
+        assert_eq!(fs::metadata(&recovery_path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            Crypto::recover_local(&original, &read_recovery_file(&recovery_path).unwrap()).unwrap().1,
+            *store.snapshot()
+        );
+        assert_eq!(directory.read_envelope().unwrap(), original);
+
+        let recovery_link = temporary.path().join("recovery-link");
+        symlink(&recovery_path, &recovery_link).unwrap();
+        let oversized = temporary.path().join("oversized.recovery");
+        fs::write(&oversized, vec![b'x'; MAX_RECOVERY_FILE + 1]).unwrap();
+        let malformed = temporary.path().join("malformed.recovery");
+        fs::write(&malformed, b"{\"secret\":\"recognizable-fake-secret\"").unwrap();
+        let foreign = temporary.path().join("foreign.recovery");
+        let foreign_crypto = Crypto::create(&passphrase()).unwrap();
+        fs::write(&foreign, &*foreign_crypto.export_recovery(Uuid::new_v4()).unwrap()).unwrap();
+        let truncated = temporary.path().join("truncated.recovery");
+        let valid = read_recovery_file(&recovery_path).unwrap();
+        fs::write(&truncated, &valid[..valid.len() / 2]).unwrap();
+        let fifo = temporary.path().join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // O_NONBLOCK plus descriptor validation must reject this without a writer.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        for file in [
+            recovery_link,
+            oversized,
+            malformed,
+            foreign,
+            truncated,
+            fifo,
+            folder,
+            temporary.path().join("missing"),
+        ] {
+            let error = store.recover_passphrase(file.clone(), replacement_passphrase()).await.unwrap_err();
+            assert!(!format!("{error:#}").contains("recognizable-fake-secret"));
+            assert!(directory.recover(file, replacement_passphrase()).await.is_err());
+            assert_eq!(directory.read_envelope().unwrap(), original);
+        }
+        let copied = temporary.path().join("copied.recovery");
+        fs::copy(&recovery_path, &copied).unwrap();
+        fs::set_permissions(&copied, fs::Permissions::from_mode(0o644)).unwrap();
+        store.recover_passphrase(copied, replacement_passphrase()).await.unwrap();
+        store.verify_passphrase(replacement_passphrase()).await.unwrap();
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_export_distinguishes_installed_warning_from_failure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temporary.path().join("vault")).unwrap();
+        let store = directory.create(passphrase()).await.unwrap();
+        let original = directory.read_envelope().unwrap();
+        let destination = temporary.path().join("emergency.recovery");
+        directory.faults.fail_before_rename_once();
+        assert!(store.save_recovery_file(passphrase(), destination.clone()).await.is_err());
+        assert!(!destination.exists());
+        assert_eq!(directory.read_envelope().unwrap(), original);
+        directory.faults.fail_recovery_directory_sync_once();
+        assert!(store.save_recovery_file(passphrase(), destination.clone()).await.unwrap().is_some());
+        assert!(!store.is_uncertain());
+        let installed = read_recovery_file(&destination).unwrap();
+        assert_eq!(Crypto::recover_local(&original, &installed).unwrap().1, *store.snapshot());
+        assert!(store.save_recovery_file(passphrase(), destination.clone()).await.is_err());
+        assert_eq!(*read_recovery_file(&destination).unwrap(), *installed);
+        assert_eq!(directory.read_envelope().unwrap(), original);
+        assert!(
+            fs::read_dir(temporary.path()).unwrap().all(|entry|
+                !entry.unwrap().file_name().to_string_lossy().starts_with(".vyx-recovery.tmp-"))
+        );
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_reset_preserves_atomic_failure_semantics() {
+        for writer_reset in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let directory = Directory::open(temporary.path().join("vault")).unwrap();
+            let store = populated_store(&directory).await;
+            let saved = store.snapshot();
+            let recovery_path = temporary.path().join("emergency.recovery");
+            store.save_recovery_file(passphrase(), recovery_path.clone()).await.unwrap();
+            let recovery = read_recovery_file(&recovery_path).unwrap();
+            let original = directory.read_envelope().unwrap();
+            assert!(store.recover_passphrase(recovery_path.clone(), Secret::new("too short")).await.is_err());
+            if !writer_reset {
+                store.shutdown().await.unwrap();
+                assert!(directory.recover(recovery_path.clone(), Secret::new("too short")).await.is_err());
+            }
+            directory.faults.fail_before_rename_once();
+            if writer_reset {
+                assert!(store.recover_passphrase(recovery_path.clone(), replacement_passphrase()).await.is_err());
+                assert!(Arc::ptr_eq(&store.snapshot(), &saved));
+                store.verify_passphrase(passphrase()).await.unwrap();
+            } else {
+                assert!(directory.recover(recovery_path.clone(), replacement_passphrase()).await.is_err());
+            }
+            assert_eq!(directory.read_envelope().unwrap(), original);
+            assert!(Crypto::unlock(&original, &replacement_passphrase()).is_err());
+            assert_eq!(Crypto::unlock(&original, &passphrase()).unwrap().decrypt_local(&original).unwrap(), *saved);
+            assert_eq!(Crypto::recover_local(&original, &recovery).unwrap().1, *saved);
+            directory.faults.fail_directory_sync_once();
+            directory.faults.fail_read_after_replace_once();
+            let reset = if writer_reset {
+                assert!(store.recover_passphrase(recovery_path.clone(), replacement_passphrase()).await.unwrap().is_some());
+                store
+            } else {
+                directory.recover(recovery_path.clone(), replacement_passphrase()).await.unwrap()
+            };
+            assert!(reset.is_uncertain());
+            assert_eq!(reset.snapshot().as_ref(), saved.as_ref());
+            // The reset succeeded without consuming the armed post-install read failure.
+            assert!(directory.read_envelope().is_err());
+            let installed = directory.read_envelope().unwrap();
+            assert!(Crypto::recover_local(&installed, &recovery).is_err());
+            assert!(Crypto::unlock(&installed, &passphrase()).is_err());
+            reset.verify_passphrase(replacement_passphrase()).await.unwrap();
+            assert!(reset.commit(true, |_| Ok(())).await.is_err());
+            assert!(reset.recover_passphrase(recovery_path, passphrase()).await.is_err());
+            let blocked_export = temporary.path().join("uncertain.recovery");
+            assert!(reset.save_recovery_file(replacement_passphrase(), blocked_export.clone()).await.is_err());
+            assert!(!blocked_export.exists());
+            assert_eq!(directory.read_envelope().unwrap(), installed);
+            reset.retry_save().await.unwrap();
+            assert!(!reset.is_uncertain());
+            reset.commit(false, |_| Ok(())).await.unwrap();
+            reset.shutdown().await.unwrap();
+            assert!(directory.unlock(passphrase()).await.is_err());
+            let reopened = directory.unlock(replacement_passphrase()).await.unwrap();
+            assert_eq!(reopened.snapshot().as_ref(), saved.as_ref());
+            reopened.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepted_recovery_reset_survives_dropped_response() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temporary.path().join("vault")).unwrap();
+        let store = directory.create(passphrase()).await.unwrap();
+        let file = temporary.path().join("emergency.recovery");
+        store.save_recovery_file(passphrase(), file.clone()).await.unwrap();
+        let saved = store.snapshot();
+        let (result, response) = oneshot::channel();
+        store.core.commands.send(Command::RecoverPassphrase {
+            file: file.clone(),
+            new: replacement_passphrase(),
+            result,
+        }).unwrap();
+        drop(response);
+        store.drain().await.unwrap();
+        assert!(Arc::ptr_eq(&saved, &store.snapshot()));
+        store.verify_passphrase(replacement_passphrase()).await.unwrap();
+        assert!(store.verify_passphrase(passphrase()).await.is_err());
+        let installed = directory.read_envelope().unwrap();
+        assert!(store.recover_passphrase(file, passphrase()).await.is_err());
+        assert_eq!(directory.read_envelope().unwrap(), installed);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_never_resets_configured_sync() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temporary.path().join("vault")).unwrap();
+        let store = directory.create(passphrase()).await.unwrap();
+        let file = temporary.path().join("emergency.recovery");
+        store.save_recovery_file(passphrase(), file.clone()).await.unwrap();
+        let configured = store.commit(false, |state| {
+            state.sync = Some(SyncState {
+                url: "https://sync.example.test".into(),
+                token: Secret::new("configured-but-paused"),
+                base_etag: Some(format!("\"{}\"", "0".repeat(64))),
+                base_snapshot_id: Some(state.vault.snapshot_id),
+                base_content_sha256: Some(state.vault.content_sha256()?),
+                pending_upload: None,
+            });
+            Ok(())
+        }).await.unwrap();
+        let original = directory.read_envelope().unwrap();
+        assert!(store.recover_passphrase(file.clone(), replacement_passphrase()).await.is_err());
+        let forbidden_export = temporary.path().join("sync.recovery");
+        assert!(store.save_recovery_file(passphrase(), forbidden_export.clone()).await.is_err());
+        assert!(!forbidden_export.exists());
+        assert_eq!(store.snapshot().as_ref(), configured.as_ref());
+        assert_eq!(directory.read_envelope().unwrap(), original);
+        store.shutdown().await.unwrap();
+        assert!(directory.recover(file.clone(), replacement_passphrase()).await.is_err());
+        assert_eq!(directory.read_envelope().unwrap(), original);
+        let reopened = directory.unlock(passphrase()).await.unwrap();
+        assert_eq!(reopened.snapshot().as_ref(), configured.as_ref());
+        reopened.shutdown().await.unwrap();
+        let missing = Directory::open(temporary.path().join("missing-vault")).unwrap();
+        assert!(missing.recover(file, replacement_passphrase()).await.is_err());
+        assert!(!missing.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_cannot_authorize_live_state_with_a_historical_payload() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temporary.path().join("vault")).unwrap();
+        let store = populated_store(&directory).await;
+        let file = temporary.path().join("historical.recovery");
+        store.save_recovery_file(passphrase(), file.clone()).await.unwrap();
+        let historical = directory.read_envelope().unwrap();
+        store.change_passphrase(passphrase(), replacement_passphrase()).await.unwrap();
+        let live = store.commit(true, |state| {
+            state.vault.snippets[0].command = "printf live-state".into();
+            Ok(())
+        }).await.unwrap();
+        let legitimate = directory.read_envelope().unwrap();
+        // VYX v1 has a four-byte magic, four-byte wrapper length, then wrapper/payload.
+        let payload_offset = |bytes: &[u8]| {
+            8 + u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize
+        };
+        let mut spliced = legitimate[..payload_offset(&legitimate)].to_vec();
+        spliced.extend_from_slice(&historical[payload_offset(&historical)..]);
+        fs::write(directory.state_path(), &spliced).unwrap();
+        let recovery = read_recovery_file(&file).unwrap();
+        let (candidate, old_state) = Crypto::recover_local(&spliced, &recovery).unwrap();
+        let current_crypto = Crypto::unlock(&legitimate, &replacement_passphrase()).unwrap();
+        assert_eq!(candidate.wrapped_identity(), current_crypto.wrapped_identity());
+        assert_eq!(old_state.vault.id, live.vault.id);
+        assert!(!candidate.same_identity(&current_crypto));
+        assert!(store.recover_passphrase(file, passphrase()).await.is_err());
+        assert!(Arc::ptr_eq(&store.snapshot(), &live));
+        assert_eq!(directory.read_envelope().unwrap(), spliced);
+        fs::write(directory.state_path(), &legitimate).unwrap();
+        store.verify_passphrase(replacement_passphrase()).await.unwrap();
+        assert!(store.verify_passphrase(passphrase()).await.is_err());
+        assert_eq!(store.decode_vault(store.export_vault(live.vault.clone()).await.unwrap()).await.unwrap(), live.vault);
+        store.shutdown().await.unwrap();
     }
 
     #[test]
@@ -958,7 +1714,7 @@ mod tests {
         assert_eq!(store.snapshot().vault.categories.len(), 2);
 
         directory.faults.fail_directory_sync_once();
-        let error = store
+        store
             .commit(true, |state| {
                 state.vault.categories.push(Category {
                     id: Uuid::new_v4(),
@@ -969,7 +1725,6 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(format!("{error:#}").contains("Save durability uncertain"));
         assert!(store.is_uncertain());
         assert_eq!(store.snapshot().vault.categories.len(), 3);
         assert!(store.commit(false, |_| Ok(())).await.is_err());
@@ -980,7 +1735,220 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn passphrase_change_preserves_state_and_old_exports_but_rejects_old_credentials() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temporary.path().join("vault")).unwrap();
+        let store = directory.create(passphrase()).await.unwrap();
+        let saved = store
+            .commit(true, |state| {
+                state.vault.categories.push(Category {
+                    id: Uuid::from_u128(1),
+                    label: "retained".into(),
+                    parent_id: None,
+                });
+                state.ai = ai_data();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let old_export = store.export_vault(saved.vault.clone()).await.unwrap();
+        let original_bytes = directory.read_envelope().unwrap();
+
+        store.verify_passphrase(passphrase()).await.unwrap();
+        assert!(
+            store
+                .verify_passphrase(Secret::new("wrong current passphrase"))
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .change_passphrase(
+                    Secret::new("wrong current passphrase"),
+                    replacement_passphrase(),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(directory.read_envelope().unwrap(), original_bytes);
+        assert_eq!(store.snapshot().as_ref(), saved.as_ref());
+
+        assert!(
+            store
+                .change_passphrase(passphrase(), Secret::new("too short"))
+                .await
+                .is_err()
+        );
+        assert_eq!(directory.read_envelope().unwrap(), original_bytes);
+
+        assert_eq!(
+            store
+                .change_passphrase(passphrase(), replacement_passphrase())
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.snapshot().as_ref(), saved.as_ref());
+        store
+            .verify_passphrase(replacement_passphrase())
+            .await
+            .unwrap();
+        assert!(store.verify_passphrase(passphrase()).await.is_err());
+
+        store.shutdown().await.unwrap();
+        assert!(directory.unlock(passphrase()).await.is_err());
+        let reopened = directory.unlock(replacement_passphrase()).await.unwrap();
+        assert_eq!(reopened.snapshot().as_ref(), saved.as_ref());
+        reopened.shutdown().await.unwrap();
+
+        let backup_directory = Directory::open(temporary.path().join("old-export")).unwrap();
+        assert!(
+            backup_directory
+                .restore(old_export.clone(), replacement_passphrase(), None)
+                .await
+                .is_err()
+        );
+        let restored = backup_directory
+            .restore(old_export, passphrase(), None)
+            .await
+            .unwrap();
+        assert_eq!(restored.snapshot().vault, saved.vault);
+        assert!(restored.snapshot().ai.is_default());
+        restored.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn configured_sync_prevents_passphrase_change_without_touching_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temporary.path().join("vault")).unwrap();
+        let store = directory.create(passphrase()).await.unwrap();
+        let configured = store
+            .commit(false, |state| {
+                state.sync = Some(SyncState {
+                    url: "https://sync.example.test".into(),
+                    token: Secret::new("configured-but-disabled"),
+                    base_etag: None,
+                    base_snapshot_id: None,
+                    base_content_sha256: None,
+                    pending_upload: None,
+                });
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let original_bytes = directory.read_envelope().unwrap();
+
+        store
+            .change_passphrase(passphrase(), replacement_passphrase())
+            .await
+            .unwrap_err();
+        assert_eq!(directory.read_envelope().unwrap(), original_bytes);
+        assert_eq!(store.snapshot().as_ref(), configured.as_ref());
+        store.verify_passphrase(passphrase()).await.unwrap();
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn passphrase_change_adopts_only_an_installed_identity_and_recovers_uncertainty() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temporary.path().join("vault")).unwrap();
+        let store = populated_store(&directory).await;
+        let saved = store.snapshot();
+        let original_bytes = directory.read_envelope().unwrap();
+
+        directory.faults.fail_before_rename_once();
+        assert!(
+            store
+                .change_passphrase(passphrase(), replacement_passphrase())
+                .await
+                .is_err()
+        );
+        assert_eq!(directory.read_envelope().unwrap(), original_bytes);
+        store.verify_passphrase(passphrase()).await.unwrap();
+        assert!(
+            store
+                .verify_passphrase(replacement_passphrase())
+                .await
+                .is_err()
+        );
+
+        directory.faults.fail_directory_sync_once();
+        store
+            .change_passphrase(passphrase(), replacement_passphrase())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(store.is_uncertain());
+        store
+            .verify_passphrase(replacement_passphrase())
+            .await
+            .unwrap();
+        assert!(store.verify_passphrase(passphrase()).await.is_err());
+
+        let installed_bytes = directory.read_envelope().unwrap();
+        store
+            .change_passphrase(
+                replacement_passphrase(),
+                Secret::new("another replacement passphrase"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(directory.read_envelope().unwrap(), installed_bytes);
+
+        store.retry_save().await.unwrap();
+        assert!(!store.is_uncertain());
+        store.shutdown().await.unwrap();
+        let reopened = directory.unlock(replacement_passphrase()).await.unwrap();
+        assert_eq!(reopened.snapshot().as_ref(), saved.as_ref());
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_drains_earlier_work_and_later_commands_fail() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temporary.path().join("vault")).unwrap();
+        let store = directory.create(passphrase()).await.unwrap();
+        let (entered, started) = oneshot::channel();
+        let (release, wait) = std_mpsc::channel();
+        let commit_store = store.clone();
+        let commit = tokio::spawn(async move {
+            commit_store
+                .commit(true, move |state| {
+                    let _ = entered.send(());
+                    wait.recv().unwrap();
+                    state.vault.categories.push(Category {
+                        id: Uuid::from_u128(2),
+                        label: "before shutdown".into(),
+                        parent_id: None,
+                    });
+                    Ok(())
+                })
+                .await
+        });
+        started.await.unwrap();
+
+        let shutdown_store = store.clone();
+        let shutdown = tokio::spawn(async move { shutdown_store.shutdown().await });
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+        commit.await.unwrap().unwrap();
+        shutdown.await.unwrap().unwrap();
+        assert_eq!(store.snapshot().vault.categories[0].label, "before shutdown");
+
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.verify_passphrase(passphrase()),
+        )
+        .await
+        .expect("a command after shutdown must not hang");
+        assert!(stopped.is_err());
+        assert!(store.retry_save().await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn export_restore_and_conflict_backup_require_semantically_identical_content() {
+        use crate::vault::model::{Host, HostAuth, HostTransport, TailscaleIdentity};
+
         let temporary = tempfile::tempdir().unwrap();
         let first_directory = Directory::open(temporary.path().join("first")).unwrap();
         let first = first_directory.create(passphrase()).await.unwrap();
@@ -991,6 +1959,33 @@ mod tests {
                     label: "kept".into(),
                     parent_id: None,
                 });
+                let keyless = Host {
+                    id: Uuid::new_v4(),
+                    label: "keyless".into(),
+                    hostname: "server.example.ts.net".into(),
+                    port: 22,
+                    category_id: None,
+                    transport: HostTransport::Tailscale,
+                    auth: HostAuth::Tailscale {
+                        username: "alice".into(),
+                        tailscale: TailscaleIdentity {
+                            tailnet_id: "stable-tailnet".into(),
+                            node_id: "stable-node".into(),
+                        },
+                    },
+                };
+                state.vault.hosts.push(keyless.clone());
+                state.vault.hosts.push(Host {
+                    id: Uuid::new_v4(),
+                    label: "standard SSH".into(),
+                    port: 2222,
+                    auth: HostAuth::Password {
+                        username: "bob".into(),
+                        password: Secret::new("retained secret"),
+                    },
+                    ..keyless
+                });
+                state.ai = ai_data();
                 Ok(())
             })
             .await
@@ -1037,6 +2032,8 @@ mod tests {
             saved.vault.content_sha256().unwrap()
         );
         let restored = second.snapshot();
+        assert_eq!(restored.vault, saved.vault);
+        assert!(restored.ai.is_default());
         let checkpoint = restored.sync.as_ref().unwrap();
         let expected_content_sha256 = saved.vault.content_sha256().unwrap();
         assert_eq!(checkpoint.base_etag.as_deref(), Some(etag.as_str()));
@@ -1045,5 +2042,51 @@ mod tests {
             checkpoint.base_content_sha256.as_deref(),
             Some(expected_content_sha256.as_str())
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ai_commits_filter_temporary_and_expired_history_without_changing_the_synced_vault() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temporary.path().join("vault")).unwrap();
+        let store = directory.create(passphrase()).await.unwrap();
+        let original = store.snapshot();
+        let retained = ai_data();
+        let mut expected = retained.clone();
+        expected.config.retention_days = Some(1);
+        let expected_id = retained.conversations[0].id;
+        let saved = store.commit(false, move |state| {
+            state.ai = retained;
+            state.ai.config.retention_days = Some(1);
+            let mut temporary = Conversation::new(None, true);
+            temporary.push(Message::new(Role::User, "temporary-content-never-saved"))?;
+            state.ai.conversations.push(temporary);
+            let mut expired = Conversation::new(None, false);
+            expired.created_at = 0;
+            expired.updated_at = 0;
+            expired.messages.push(Message::new(Role::User, "expired-content"));
+            state.ai.conversations.push(expired);
+            Ok(())
+        }).await.unwrap();
+        assert_eq!(saved.ai, expected);
+        assert_eq!(saved.vault, original.vault);
+        assert_eq!(saved.vault.snapshot_id, original.vault.snapshot_id);
+        let bytes = directory.read_envelope().unwrap();
+        for secret in ["local-only-ai-api-key", "local-only-chat-history", "temporary-content-never-saved"] {
+            assert!(!bytes.windows(secret.len()).any(|bytes| bytes == secret.as_bytes()));
+        }
+        store.shutdown().await.unwrap();
+        let reopened = directory.unlock(passphrase()).await.unwrap();
+        assert_eq!(reopened.snapshot().as_ref(), saved.as_ref());
+        let deleted = reopened.commit(false, move |state| {
+            assert!(state.ai.remove_conversation(expected_id));
+            Ok(())
+        }).await.unwrap();
+        assert!(deleted.ai.conversations.is_empty());
+        assert_eq!(deleted.ai.profiles, expected.profiles);
+        assert_eq!(deleted.vault, original.vault);
+        reopened.shutdown().await.unwrap();
+        let reopened = directory.unlock(passphrase()).await.unwrap();
+        assert_eq!(reopened.snapshot().as_ref(), deleted.as_ref());
+        reopened.shutdown().await.unwrap();
     }
 }
