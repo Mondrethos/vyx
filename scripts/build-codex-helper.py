@@ -205,15 +205,25 @@ def prepare(work):
     return checkout
 
 
+def musl_environment(target):
+    """Compiler settings shared by the native and container builds."""
+    key = target.replace("-", "_")
+    environment = {f"CC_{key}": "musl-gcc", f"CARGO_TARGET_{key.upper()}_LINKER": "musl-gcc"}
+    if target.startswith("aarch64-"):
+        # GCC's default outline atomics need libgcc's LSE probe, which calls glibc's
+        # __getauxval and cannot link against musl; jemalloc would then find no atomics.
+        environment[f"CFLAGS_{key}"] = "-mno-outline-atomics"
+    return environment
+
+
 def native_build(checkout, target, jobs):
     for tool in ["cargo", "rustup", "musl-gcc", "cmake", "clang", "perl", "make", "readelf"]:
         if not shutil.which(tool):
             raise RuntimeError(f"native build requires {tool}; omit --native to use rootless podman")
     run(["rustup", "target", "add", "--toolchain", RUST, target])
     environment = os.environ.copy()
+    environment.update(musl_environment(target))
     environment.update({
-        f"CC_{target.replace('-', '_')}": "musl-gcc",
-        f"CARGO_TARGET_{target.replace('-', '_').upper()}_LINKER": "musl-gcc",
         "CARGO_BUILD_JOBS": str(jobs),
         "CARGO_INCREMENTAL": "0",
         "SOURCE_DATE_EPOCH": "1789603200",
@@ -325,10 +335,10 @@ def main():
         if Path(engine).name == "podman":
             command += ["--userns=keep-id"]
         command += ["--env", "HOME=/tmp", "--env", "CARGO_HOME=/source/.cargo-build", "--env", "CARGO_INCREMENTAL=0",
-                    "--env", f"CARGO_BUILD_JOBS={args.jobs}", "--env", "SOURCE_DATE_EPOCH=1789603200",
-                    "--env", f"CC_{target.replace('-', '_')}=musl-gcc",
-                    "--env", f"CARGO_TARGET_{target.replace('-', '_').upper()}_LINKER=musl-gcc",
-                    image, "cargo", f"+{RUST}", "rustc", "--locked", "--release", "--package", "codex-app-server", "--bin", "codex-app-server", "--target", target,
+                    "--env", f"CARGO_BUILD_JOBS={args.jobs}", "--env", "SOURCE_DATE_EPOCH=1789603200"]
+        for name, value in musl_environment(target).items():
+            command += ["--env", f"{name}={value}"]
+        command += [image, "cargo", f"+{RUST}", "rustc", "--locked", "--release", "--package", "codex-app-server", "--bin", "codex-app-server", "--target", target,
                     "--", "-C", "link-arg=-Wl,--no-dynamic-linker"]
         try:
             run(command)
