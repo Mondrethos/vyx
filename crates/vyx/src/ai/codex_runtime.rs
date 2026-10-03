@@ -3,14 +3,18 @@
 use std::{
     ffi::CString,
     fs::{File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
-    process::Stdio,
     time::Duration,
+};
+#[cfg(target_os = "linux")]
+use std::{
+    io::{Seek, SeekFrom},
+    process::Stdio,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -18,9 +22,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncReadExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    io::BufReader,
+    process::{Child, ChildStdin, ChildStdout},
 };
+#[cfg(target_os = "linux")]
+use tokio::{io::AsyncReadExt, process::Command};
 use zeroize::Zeroizing;
 
 use super::model::Profile;
@@ -237,7 +243,8 @@ fn open_at(directory: &File, name: &str, flags: i32, mode: libc::mode_t) -> io::
             directory.as_raw_fd(),
             name.as_ptr(),
             flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            mode,
+            // Variadic arguments are promoted to unsigned int; mode_t is narrower on macOS.
+            mode as libc::c_uint,
         )
     };
     if fd < 0 {

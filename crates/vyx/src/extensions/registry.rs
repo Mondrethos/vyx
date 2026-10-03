@@ -591,7 +591,8 @@ pub(super) fn open_at(directory: &File, name: &str, flags: i32, mode: libc::mode
     // O_NONBLOCK avoids blocking on hostile FIFOs before descriptor validation.
     // SAFETY: directory owns its fd; name is NUL terminated; a successful call
     // returns a new owned fd, immediately transferred to File.
-    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK, mode) };
+    // Variadic arguments are promoted to unsigned int; mode_t is narrower on macOS.
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK, mode as libc::c_uint) };
     if fd < 0 { return Err(io::Error::last_os_error()); }
     Ok(unsafe { File::from_raw_fd(fd) })
 }

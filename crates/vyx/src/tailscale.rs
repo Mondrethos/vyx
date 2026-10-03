@@ -490,6 +490,7 @@ impl<'de> Deserialize<'de> for RawPeers {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+    #[cfg(target_os = "linux")]
     use tokio::io::AsyncWriteExt;
 
     fn fixture() -> Value {
