@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vyx — screens</title>
+<meta name="description" content="Five Vyx screens captured from the release build and redrawn cell by cell.">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#282828">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="preload" href="assets/fonts/geist-mono-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/instrument-serif-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/instrument-serif-italic-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="assets/site.css">
+<link rel="modulepreload" href="assets/js/screen-frame.js">
+<link rel="modulepreload" href="assets/js/scenes-data.js">
+<script type="module" src="assets/js/screens.js"></script>
+</head>
+<body>
+<header class="s-header">
+  <div class="s-page s-header-row">
+    <a class="v-wordmark" href="./" aria-label="Vyx home">
+      <svg viewBox="0 0 12 12" width="22" height="22" aria-hidden="true"><rect width="12" height="12" rx="2" fill="#1d2021"/><g transform="translate(2.5 1)" fill="#fabd2f"><rect x="0" y="0" width="2" height="4"/><rect x="5" y="0" width="2" height="4"/><rect x="1" y="4" width="2" height="4"/><rect x="4" y="4" width="2" height="4"/><rect x="2" y="8" width="3" height="2"/></g></svg>
+      <span>vyx</span>
+    </a>
+    <nav class="s-nav" aria-label="Site">
+      <a class="v-link is-quiet" href="screens.html" aria-current="page">screens</a>
+      <a class="v-link is-quiet" href="https://github.com/Mondrethos/vyx#readme">docs</a>
+      <a class="v-link is-quiet" href="https://github.com/Mondrethos/vyx">github</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="s-intro">
+    <div class="s-page">
+      <p class="v-label">Screens</p>
+      <h1 class="v-title">The real <em>interface</em>.</h1>
+      <p class="s-lede">Captured from the release build with a demo vault and redrawn cell by cell, shown here in gruvbox-dark-medium.</p>
+    </div>
+  </section>
+
+  <section class="s-screen" aria-labelledby="sc-grid">
+    <div class="s-page">
+      <div class="s-screen-head">
+        <p class="v-label">01</p>
+        <h2 class="v-subtitle" id="sc-grid">Workspace</h2>
+        <p class="s-screen-body">A sidebar of sessions, servers, credentials, and snippets beside four SSH sessions in a grid.</p>
+      </div>
+      <figure class="v-frame" data-scene="grid">
+        <div class="v-frame-screen">
+          <canvas class="v-frame-canvas" role="img" aria-label="Workspace: A sidebar of sessions, servers, credentials, and snippets beside four SSH sessions in a grid."></canvas>
+        </div>
+      </figure>
+    </div>
+  </section>
+
+  <section class="s-screen" aria-labelledby="sc-commands">
+    <div class="s-page">
+      <div class="s-screen-head">
+        <p class="v-label">02</p>
+        <h2 class="v-subtitle" id="sc-commands">Command bar</h2>
+        <p class="s-screen-body">Ctrl+B opens a bar that shows every key. The keys are yours to change.</p>
+      </div>
+      <figure class="v-frame" data-scene="commands" data-crop="0,18,150,18">
+        <div class="v-frame-screen">
+          <canvas class="v-frame-canvas" role="img" aria-label="Command bar: Ctrl+B opens a bar that shows every key. The keys are yours to change."></canvas>
+        </div>
+      </figure>
+    </div>
+  </section>
+
+  <section class="s-screen" aria-labelledby="sc-unlock">
+    <div class="s-page">
+      <div class="s-screen-head">
+        <p class="v-label">03</p>
+        <h2 class="v-subtitle" id="sc-unlock">Unlock</h2>
+        <p class="s-screen-body">The vault opens only with your passphrase or recovery file.</p>
+      </div>
+      <figure class="v-frame" data-scene="unlock" data-crop="33,1,84,29">
+        <div class="v-frame-screen">
+          <canvas class="v-frame-canvas" role="img" aria-label="Unlock: The vault opens only with your passphrase or recovery file."></canvas>
+        </div>
+      </figure>
+    </div>
+  </section>
+
+  <section class="s-screen" aria-labelledby="sc-review">
+    <div class="s-page">
+      <div class="s-screen-head">
+        <p class="v-label">04</p>
+        <h2 class="v-subtitle" id="sc-review">Review</h2>
+        <p class="s-screen-body">Vyx AI asks before a privilege change: sudo systemctl restart php-fpm on web-01, Approve or Cancel.</p>
+      </div>
+      <figure class="v-frame" data-scene="review">
+        <div class="v-frame-screen">
+          <canvas class="v-frame-canvas" role="img" aria-label="Review: Vyx AI asks before a privilege change: sudo systemctl restart php-fpm on web-01, Approve or Cancel."></canvas>
+        </div>
+      </figure>
+    </div>
+  </section>
+
+  <section class="s-screen" aria-labelledby="sc-themes">
+    <div class="s-page">
+      <div class="s-screen-head">
+        <p class="v-label">05</p>
+        <h2 class="v-subtitle" id="sc-themes">Themes</h2>
+        <p class="s-screen-body">565 Base16, Base24, and Tinted8 themes. Apply recolors the interface and your sessions without reconnecting.</p>
+      </div>
+      <figure class="v-frame" data-scene="themes">
+        <div class="v-frame-screen">
+          <canvas class="v-frame-canvas" role="img" aria-label="Themes: 565 Base16, Base24, and Tinted8 themes. Apply recolors the interface and your sessions without reconnecting."></canvas>
+        </div>
+      </figure>
+    </div>
+  </section>
+
+  <section class="s-next">
+    <div class="s-page"><a class="v-link s-next-link" href="./">Install Vyx<span class="v-link-arrow" aria-hidden="true">→</span></a></div>
+  </section>
+</main>
+
+<footer class="s-footer">
+  <div class="s-page s-footer-row">
+    <span class="v-wordmark">
+      <svg viewBox="0 0 12 12" width="18" height="18" aria-hidden="true"><rect width="12" height="12" rx="2" fill="#1d2021"/><g transform="translate(2.5 1)" fill="#fabd2f"><rect x="0" y="0" width="2" height="4"/><rect x="5" y="0" width="2" height="4"/><rect x="1" y="4" width="2" height="4"/><rect x="4" y="4" width="2" height="4"/><rect x="2" y="8" width="3" height="2"/></g></svg>
+      <span>vyx</span>
+    </span>
+    <span class="s-faint">encrypted SSH workspace</span>
+    <nav class="s-nav" aria-label="Project">
+      <a class="v-link is-quiet" href="https://github.com/Mondrethos/vyx">source</a>
+      <a class="v-link is-quiet" href="https://github.com/Mondrethos/vyx/releases">releases</a>
+      <a class="v-link is-quiet" href="https://github.com/Mondrethos/vyx#readme">docs</a>
+    </nav>
+    <p class="s-credits">Themes from <a href="https://github.com/tinted-theming">Tinted Theming</a> (MIT). Icons in the screens from <a href="https://github.com/microsoft/vscode-codicons">Codicons</a> (CC BY 4.0).</p>
+  </div>
+</footer>
+</body>
+</html>

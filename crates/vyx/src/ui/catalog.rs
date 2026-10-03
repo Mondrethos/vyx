@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
-use crate::vault::{Auth, Category, Credential, Host, Vault};
+use crate::vault::{Auth, Category, Credential, Host, HostAuth, Vault};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Section {
@@ -46,10 +46,30 @@ pub struct Catalog {
     selected: usize,
     viewport: usize,
     filter: String,
+    /// The selection before the first kept filter, restored when that filter is cleared.
+    filter_origin: Option<RowKey>,
+    /// A selection the next rebuild applies once its rows exist.
+    pending: Option<Pending>,
     expanded_categories: HashSet<Uuid>,
     expanded_sections: HashSet<Section>,
     ungrouped_expanded: bool,
+    snippets_expanded: bool,
     needs_rebuild: bool,
+}
+
+enum Pending {
+    /// Expand the record's section and parent categories, then select it.
+    Reveal(RowKey),
+    /// Select the record only if it is still visible.
+    Restore(RowKey),
+}
+
+impl Pending {
+    fn key(&self) -> &RowKey {
+        match self {
+            Self::Reveal(key) | Self::Restore(key) => key,
+        }
+    }
 }
 
 impl Default for Catalog {
@@ -59,6 +79,8 @@ impl Default for Catalog {
             selected: 0,
             viewport: 0,
             filter: String::new(),
+            filter_origin: None,
+            pending: None,
             expanded_categories: HashSet::new(),
             expanded_sections: HashSet::from([
                 Section::Sessions,
@@ -68,6 +90,7 @@ impl Default for Catalog {
                 Section::Sync,
             ]),
             ungrouped_expanded: true,
+            snippets_expanded: true,
             needs_rebuild: true,
         }
     }
@@ -102,6 +125,52 @@ impl Catalog {
         }
     }
 
+    /// A filter is set but no record matches it, so only section headers remain.
+    pub fn no_matches(&self) -> bool {
+        !self.filter.is_empty() && self.rows.iter().all(|row| matches!(row.key, RowKey::Section(_)))
+    }
+
+    /// Remembers the selection that a later `clear_filter` restores.
+    pub fn set_filter_origin(&mut self, origin: Option<RowKey>) {
+        self.filter_origin = origin;
+    }
+
+    /// Clears a kept filter. The next rebuild restores the selection from before the filter
+    /// when that row still exists. Returns whether a filter was set.
+    pub fn clear_filter(&mut self) -> bool {
+        if self.filter.is_empty() {
+            return false;
+        }
+        self.filter.clear();
+        self.pending = self.filter_origin.take().map(Pending::Restore);
+        self.needs_rebuild = true;
+        true
+    }
+
+    /// Clears any filter; the next rebuild expands the record's section and parent
+    /// categories and selects it.
+    pub fn reveal(&mut self, key: RowKey) {
+        self.filter.clear();
+        self.filter_origin = None;
+        self.pending = Some(Pending::Reveal(key));
+        self.needs_rebuild = true;
+    }
+
+    /// Selects the first matching record, else the first grouping row that matched (a
+    /// category, Ungrouped, or Snippets); false when only section headers remain.
+    pub fn select_first_match(&mut self) -> bool {
+        let record = |row: &CatalogRow| {
+            matches!(row.key, RowKey::Session(_) | RowKey::Host(_) | RowKey::Credential(_) | RowKey::Snippet(_) | RowKey::Sync)
+        };
+        let Some(index) = self.rows.iter().position(record)
+            .or_else(|| self.rows.iter().position(|row| !matches!(row.key, RowKey::Section(_))))
+        else {
+            return false;
+        };
+        self.selected = index;
+        true
+    }
+
     pub fn invalidate(&mut self) {
         self.needs_rebuild = true;
     }
@@ -114,50 +183,27 @@ impl Catalog {
         if !self.needs_rebuild {
             return;
         }
-        let sessions_empty = sessions.len() == 0;
+        let session_count = sessions.len();
         let old_key = self.selected_key();
+        let pending = self.pending.take();
         // A moved record remains selected even if its new parent was collapsed.
-        let mut parent = match old_key.as_ref() {
-            Some(RowKey::Host(id)) => {
-                self.expanded_sections.insert(Section::Servers);
-                let category = vault
-                    .hosts
-                    .iter()
-                    .find(|host| host.id == *id)
-                    .and_then(|host| host.category_id);
-                if category.is_none() {
-                    self.ungrouped_expanded = true;
-                }
-                category
-            }
-            Some(RowKey::Category(id)) => {
-                self.expanded_sections.insert(Section::Servers);
-                vault
-                    .categories
-                    .iter()
-                    .find(|category| category.id == *id)
-                    .and_then(|category| category.parent_id)
-            }
-            _ => None,
-        };
-        while let Some(id) = parent {
-            self.expanded_categories.insert(id);
-            parent = vault
-                .categories
-                .iter()
-                .find(|category| category.id == id)
-                .and_then(|category| category.parent_id);
+        if let Some(key @ (RowKey::Host(_) | RowKey::Category(_))) = &old_key {
+            self.expand_to(vault, key);
+        }
+        if let Some(Pending::Reveal(key)) = &pending {
+            self.expand_to(vault, key);
         }
         let first_build = old_key.is_none() && self.rows.is_empty();
         let old_index = self.selected;
         let query = self.filter.to_lowercase();
         let filtering = !query.is_empty();
+        // Each section's header label with its visible rows; headers are placed below.
+        let mut sections = Vec::with_capacity(5);
         let mut rows = Vec::new();
 
-        self.push_section(&mut rows, Section::Sessions, "Sessions");
         if self.section_open(Section::Sessions, filtering) {
             for session in sessions {
-                if query.is_empty() || session.label.to_lowercase().contains(&query) {
+                if matches_query(&query, [session.label]) {
                     rows.push(CatalogRow {
                         key: RowKey::Session(session.id),
                         label: session.label.to_owned(),
@@ -168,8 +214,8 @@ impl Catalog {
                 }
             }
         }
+        sections.push((Section::Sessions, format!("Sessions ({session_count})"), std::mem::take(&mut rows)));
 
-        self.push_section(&mut rows, Section::Servers, "Servers");
         if self.section_open(Section::Servers, filtering) {
             let credentials: HashMap<_, _> = vault
                 .credentials
@@ -238,8 +284,8 @@ impl Catalog {
                 }
             }
         }
+        sections.push((Section::Servers, format!("Servers ({})", vault.hosts.len()), std::mem::take(&mut rows)));
 
-        self.push_section(&mut rows, Section::Credentials, "Credentials");
         if self.section_open(Section::Credentials, filtering) {
             let mut credentials: Vec<_> = vault.credentials.iter().collect();
             credentials.sort_by_cached_key(|entry| (entry.label.to_lowercase(), entry.id));
@@ -259,42 +305,43 @@ impl Catalog {
                 }
             }
         }
+        sections.push((Section::Credentials, format!("Credentials ({})", vault.credentials.len()), std::mem::take(&mut rows)));
 
-        self.push_section(&mut rows, Section::Tools, "Tools");
         if self.section_open(Section::Tools, filtering) {
             let mut snippets: Vec<_> = vault.snippets.iter().collect();
             snippets.sort_by_cached_key(|entry| (entry.label.to_lowercase(), entry.id));
             let matching: Vec<_> = snippets
                 .into_iter()
                 .filter(|snippet| {
-                    query.is_empty()
-                        || snippet.label.to_lowercase().contains(&query)
-                        || snippet.command.to_lowercase().contains(&query)
+                    matches_query(&query, [snippet.label.as_str(), snippet.command.as_str()])
                 })
                 .collect();
-            if !filtering || !matching.is_empty() || "snippets".contains(&query) {
+            if !filtering || !matching.is_empty() || matches_query(&query, ["snippets"]) {
+                let expanded = self.snippets_expanded || filtering;
                 rows.push(CatalogRow {
                     key: RowKey::Snippets,
                     label: "Snippets".to_owned(),
                     indent: 1,
-                    expandable: false,
-                    expanded: false,
+                    expandable: true,
+                    expanded,
                 });
-                for snippet in matching {
-                    rows.push(CatalogRow {
-                        key: RowKey::Snippet(snippet.id),
-                        label: snippet.label.clone(),
-                        indent: 2,
-                        expandable: false,
-                        expanded: false,
-                    });
+                if expanded {
+                    for snippet in matching {
+                        rows.push(CatalogRow {
+                            key: RowKey::Snippet(snippet.id),
+                            label: snippet.label.clone(),
+                            indent: 2,
+                            expandable: false,
+                            expanded: false,
+                        });
+                    }
                 }
             }
         }
+        sections.push((Section::Tools, format!("Tools ({})", vault.snippets.len()), std::mem::take(&mut rows)));
 
-        self.push_section(&mut rows, Section::Sync, "Sync");
         if self.section_open(Section::Sync, filtering)
-            && (query.is_empty() || "sync".contains(&query))
+            && matches_query(&query, ["sync"])
         {
             rows.push(CatalogRow {
                 key: RowKey::Sync,
@@ -304,26 +351,47 @@ impl Catalog {
                 expanded: false,
             });
         }
+        sections.push((Section::Sync, "Sync".to_owned(), rows));
+
+        // While a filter has matches, headers of sections without any stay hidden; with no
+        // match at all every header remains so the list is never blank.
+        let matched = filtering && sections.iter().any(|(_, _, children)| !children.is_empty());
+        let mut rows = Vec::with_capacity(sections.iter().map(|(_, _, children)| children.len() + 1).sum());
+        for (section, label, children) in sections {
+            if matched && children.is_empty() {
+                continue;
+            }
+            rows.push(CatalogRow {
+                key: RowKey::Section(section),
+                label,
+                indent: 0,
+                expandable: true,
+                expanded: self.expanded_sections.contains(&section),
+            });
+            rows.extend(children);
+        }
 
         self.rows = rows;
-        self.selected = old_key
-            .and_then(|key| self.rows.iter().position(|row| row.key == key))
-            .unwrap_or_else(|| {
-                old_index
-                    .saturating_sub(1)
-                    .min(self.rows.len().saturating_sub(1))
-            });
+        let rows = &self.rows;
+        let position = |key: &RowKey| rows.iter().position(|row| &row.key == key);
+        let selected = pending
+            .as_ref()
+            .and_then(|pending| position(pending.key()))
+            .or_else(|| old_key.as_ref().and_then(position))
+            .unwrap_or_else(|| old_index.saturating_sub(1).min(rows.len().saturating_sub(1)));
+        self.selected = selected;
         if first_build
-            && sessions_empty
+            && session_count == 0
             && vault.categories.is_empty()
             && vault.credentials.is_empty()
             && vault.hosts.is_empty()
             && vault.snippets.is_empty()
         {
+            // An empty workspace starts where its first server is added.
             if let Some(index) = self
                 .rows
                 .iter()
-                .position(|row| row.key == RowKey::Section(Section::Credentials))
+                .position(|row| row.key == RowKey::Section(Section::Servers))
             {
                 self.selected = index;
             }
@@ -335,14 +403,64 @@ impl Catalog {
         self.needs_rebuild = false;
     }
 
-    fn push_section(&self, rows: &mut Vec<CatalogRow>, section: Section, label: &str) {
-        rows.push(CatalogRow {
-            key: RowKey::Section(section),
-            label: label.to_owned(),
-            indent: 0,
-            expandable: true,
-            expanded: self.expanded_sections.contains(&section),
-        });
+    /// Expands the section, group, and parent categories that contain `key`.
+    fn expand_to(&mut self, vault: &Vault, key: &RowKey) {
+        let mut parent = match key {
+            RowKey::Section(_) => None,
+            RowKey::Session(_) => {
+                self.expanded_sections.insert(Section::Sessions);
+                None
+            }
+            RowKey::Host(id) => {
+                self.expanded_sections.insert(Section::Servers);
+                let category = vault
+                    .hosts
+                    .iter()
+                    .find(|host| host.id == *id)
+                    .and_then(|host| host.category_id);
+                if category.is_none() {
+                    self.ungrouped_expanded = true;
+                }
+                category
+            }
+            RowKey::Category(id) => {
+                self.expanded_sections.insert(Section::Servers);
+                vault
+                    .categories
+                    .iter()
+                    .find(|category| category.id == *id)
+                    .and_then(|category| category.parent_id)
+            }
+            RowKey::Ungrouped => {
+                self.expanded_sections.insert(Section::Servers);
+                None
+            }
+            RowKey::Credential(_) => {
+                self.expanded_sections.insert(Section::Credentials);
+                None
+            }
+            RowKey::Snippets => {
+                self.expanded_sections.insert(Section::Tools);
+                None
+            }
+            RowKey::Snippet(_) => {
+                self.expanded_sections.insert(Section::Tools);
+                self.snippets_expanded = true;
+                None
+            }
+            RowKey::Sync => {
+                self.expanded_sections.insert(Section::Sync);
+                None
+            }
+        };
+        while let Some(id) = parent {
+            self.expanded_categories.insert(id);
+            parent = vault
+                .categories
+                .iter()
+                .find(|category| category.id == id)
+                .and_then(|category| category.parent_id);
+        }
     }
 
     fn section_open(&self, section: Section, filtering: bool) -> bool {
@@ -430,6 +548,10 @@ impl Catalog {
                 self.ungrouped_expanded = true;
                 self.needs_rebuild = true;
             }
+            RowKey::Snippets => {
+                self.snippets_expanded = true;
+                self.needs_rebuild = true;
+            }
             _ => {}
         }
     }
@@ -460,6 +582,10 @@ impl Catalog {
                 self.ungrouped_expanded = false;
                 self.needs_rebuild = true;
             }
+            RowKey::Snippets => {
+                self.snippets_expanded = false;
+                self.needs_rebuild = true;
+            }
             _ => {}
         }
     }
@@ -477,6 +603,7 @@ impl Catalog {
                     self.expanded_categories.remove(&id);
                 }
                 RowKey::Ungrouped => self.ungrouped_expanded = false,
+                RowKey::Snippets => self.snippets_expanded = false,
                 _ => return,
             }
         } else {
@@ -488,6 +615,7 @@ impl Catalog {
                     self.expanded_categories.insert(id);
                 }
                 RowKey::Ungrouped => self.ungrouped_expanded = true,
+                RowKey::Snippets => self.snippets_expanded = true,
                 _ => return,
             }
         }
@@ -523,19 +651,19 @@ impl Search<'_> {
         if self.query.is_empty() {
             return true;
         }
-        host.label.to_lowercase().contains(self.query)
-            || host.hostname.to_lowercase().contains(self.query)
-            || self
-                .credentials
-                .get(&host.credential_id)
-                .is_some_and(|credential| {
-                    credential.label.to_lowercase().contains(self.query)
-                        || credential.username.to_lowercase().contains(self.query)
-                })
-            || host
-                .category_id
-                .and_then(|id| self.paths.get(&id))
-                .is_some_and(|path| path.contains(self.query))
+        let (credential_label, username) = match &host.auth {
+            HostAuth::Credential { credential_id } => self.credentials.get(credential_id)
+                .map_or(("", ""), |entry| (entry.label.as_str(), entry.username.as_str())),
+            HostAuth::Password { username, .. } | HostAuth::Tailscale { username, .. } => ("", username.as_str()),
+        };
+        let category = host.category_id.and_then(|id| self.paths.get(&id));
+        matches_query(self.query, [
+            host.label.as_str(),
+            host.hostname.as_str(),
+            credential_label,
+            username,
+            category.map_or("", String::as_str),
+        ])
     }
 
     fn category_has_match(&self, id: Uuid) -> bool {
@@ -545,7 +673,7 @@ impl Search<'_> {
         if self
             .paths
             .get(&id)
-            .is_some_and(|path| path.contains(self.query))
+            .is_some_and(|path| matches_query(self.query, [path.as_str()]))
         {
             return true;
         }
@@ -587,9 +715,15 @@ fn category_paths(categories: &[Category]) -> HashMap<Uuid, String> {
 }
 
 fn credential_matches(credential: &Credential, query: &str) -> bool {
-    query.is_empty()
-        || credential.label.to_lowercase().contains(query)
-        || credential.username.to_lowercase().contains(query)
+    matches_query(query, [credential.label.as_str(), credential.username.as_str()])
+}
+
+fn matches_query<const N: usize>(query: &str, fields: [&str; N]) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let fields = fields.map(str::to_lowercase);
+    query.split_whitespace().all(|word| fields.iter().any(|field| field.contains(word)))
 }
 
 #[cfg(test)]
@@ -624,8 +758,9 @@ mod tests {
             label: "Move me".into(),
             hostname: "example.test".into(),
             port: 22,
+            transport: crate::vault::HostTransport::Direct,
             category_id: None,
-            credential_id: credential,
+            auth: HostAuth::Credential { credential_id: credential },
         });
         let mut catalog = Catalog::default();
         catalog.expanded_sections.insert(Section::Servers);
@@ -636,5 +771,98 @@ mod tests {
         catalog.invalidate();
         catalog.rebuild(&vault, std::iter::empty());
         assert_eq!(catalog.selected_key(), Some(RowKey::Host(host)));
+    }
+
+    #[test]
+    fn search_words_cross_metadata_fields_but_never_search_secrets() {
+        let mut vault = Vault::new();
+        let credential = Uuid::from_u128(1);
+        let category = Uuid::from_u128(2);
+        let host = Uuid::from_u128(3);
+        vault.credentials.push(Credential {
+            id: credential,
+            label: "Operations".into(),
+            username: "deploy".into(),
+            auth: Auth::Password { password: crate::vault::Secret::new("hidden-needle") },
+        });
+        vault.categories.push(Category {
+            id: category,
+            label: "Production".into(),
+            parent_id: None,
+        });
+        vault.hosts.push(Host {
+            id: host,
+            label: "Database".into(),
+            hostname: "db.example.test".into(),
+            port: 22,
+            transport: crate::vault::HostTransport::Direct,
+            category_id: Some(category),
+            auth: HostAuth::Credential { credential_id: credential },
+        });
+        let mut catalog = Catalog::default();
+        catalog.set_filter("  PROD   deploy db  ".into());
+        catalog.rebuild(&vault, std::iter::empty());
+        assert!(catalog.rows().iter().any(|row| row.key == RowKey::Host(host)));
+        catalog.set_filter("prod missing".into());
+        catalog.rebuild(&vault, std::iter::empty());
+        assert!(!catalog.rows().iter().any(|row| row.key == RowKey::Host(host)));
+        catalog.set_filter("hidden-needle".into());
+        catalog.rebuild(&vault, std::iter::empty());
+        assert!(!catalog.rows().iter().any(|row| matches!(row.key, RowKey::Host(_) | RowKey::Credential(_))));
+        vault.hosts[0].auth = HostAuth::Password {
+            username: "server-account".into(),
+            password: crate::vault::Secret::new("server-only-secret"),
+        };
+        catalog.set_filter("prod server-account".into());
+        catalog.rebuild(&vault, std::iter::empty());
+        assert!(catalog.rows().iter().any(|row| row.key == RowKey::Host(host)));
+        catalog.set_filter("server-only-secret".into());
+        catalog.rebuild(&vault, std::iter::empty());
+        assert!(!catalog.rows().iter().any(|row| row.key == RowKey::Host(host)));
+        catalog.set_filter("Operations".into());
+        catalog.rebuild(&vault, std::iter::empty());
+        assert!(!catalog.rows().iter().any(|row| row.key == RowKey::Host(host)));
+    }
+
+    #[test]
+    fn a_filter_keeps_only_matching_sections_and_counts_ignore_it() {
+        let mut vault = Vault::new();
+        let category = Uuid::from_u128(1);
+        let host = Uuid::from_u128(2);
+        vault.categories.push(Category {
+            id: category,
+            label: "Production".into(),
+            parent_id: None,
+        });
+        vault.hosts.push(Host {
+            id: host,
+            label: "Database".into(),
+            hostname: "db.example.test".into(),
+            port: 22,
+            transport: crate::vault::HostTransport::Direct,
+            category_id: Some(category),
+            auth: HostAuth::Password {
+                username: "deploy".into(),
+                password: crate::vault::Secret::new("unsearched"),
+            },
+        });
+        let mut catalog = Catalog::default();
+        catalog.rebuild(&vault, std::iter::empty());
+        let servers = |catalog: &Catalog| {
+            catalog.rows().iter().find(|row| row.key == RowKey::Section(Section::Servers)).unwrap().label.clone()
+        };
+        let unfiltered = servers(&catalog);
+        catalog.set_filter("data".into());
+        catalog.rebuild(&vault, std::iter::empty());
+        let keys: Vec<_> = catalog.rows().iter().map(|row| row.key.clone()).collect();
+        assert_eq!(keys, [RowKey::Section(Section::Servers), RowKey::Category(category), RowKey::Host(host)]);
+        assert!(catalog.select_first_match());
+        assert_eq!(catalog.selected_key(), Some(RowKey::Host(host)), "the match, not its category, is selected");
+        assert_eq!(servers(&catalog), unfiltered);
+        catalog.set_filter("nothing matches".into());
+        catalog.rebuild(&vault, std::iter::empty());
+        assert!(catalog.no_matches());
+        assert_eq!(catalog.rows().len(), 5, "every header remains when nothing matches");
+        assert_eq!(servers(&catalog), unfiltered);
     }
 }

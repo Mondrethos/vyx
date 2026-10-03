@@ -1,0 +1,16 @@
+{
+  "name": "@vyx/tailscale-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24 <25" },
+  "scripts": {
+    "build": "vyx-extension build",
+    "pack": "vyx-extension pack",
+    "dev": "vyx-extension dev --id dev.vyx.tailscale",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": { "@vyx/extension-sdk": "0.1.0" },
+  "devDependencies": { "typescript": "5.9.3" }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "@vyx/extension-sdk",
+  "version": "0.1.0",
+  "description": "Typed, sandboxed Vyx extension API and pinned Javy author tooling",
+  "type": "module",
+  "engines": { "node": ">=24 <25" },
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./manifest": { "types": "./dist/manifest.d.ts", "import": "./dist/manifest.js" }
+  },
+  "bin": { "vyx-extension": "./bin/vyx-extension.mjs" },
+  "files": ["bin", "dist", "templates"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": { "esbuild": "0.25.12", "typescript": "5.9.3" },
+  "devDependencies": { "@types/node": "24.10.1" }
+}

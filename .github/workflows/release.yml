@@ -44,9 +44,217 @@ jobs:
             exit 1
           fi
 
+  author-assets:
+    name: Build canonical extension and SDK assets
+    needs: validate-version
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Node 24.21.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.21.0"
+          cache: npm
+
+      - name: Install verified Javy 9.1.0
+        run: |
+          set -euo pipefail
+          tools="${RUNNER_TEMP}/vyx-author-tools"
+          install -d "$tools"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            https://github.com/bytecodealliance/javy/releases/download/v9.1.0/javy-x86_64-linux-v9.1.0.gz \
+            --output "${tools}/javy.gz"
+          printf '%s  %s\n' \
+            a68b122d48eb3dfc1b801d4e14c39271fde3638243d3272d206e376ac9189e39 \
+            "${tools}/javy.gz" | sha256sum --check --strict
+          gzip --decompress --stdout "${tools}/javy.gz" > "${tools}/javy"
+          chmod 755 "${tools}/javy"
+          "${tools}/javy" --version
+          printf '%s\n' "$tools" >> "$GITHUB_PATH"
+
+      - name: Build and verify public SDK and canonical first-party packages
+        run: |
+          set -euo pipefail
+          cp extensions/tailscale/dist/com.vyx.tailscale.vyxext \
+            "${RUNNER_TEMP}/committed-tailscale.vyxext"
+          cp extensions/ai/dist/com.vyx.ai.vyxext \
+            "${RUNNER_TEMP}/committed-ai.vyxext"
+          npm ci --ignore-scripts
+          npm run typecheck -w @vyx/extension-sdk
+          npm run build -w @vyx/extension-sdk
+          npm test -w @vyx/extension-sdk
+          npm run typecheck -w @vyx/tailscale-extension
+          npm test -w @vyx/tailscale-extension
+          npm run build -w @vyx/tailscale-extension
+          cmp "${RUNNER_TEMP}/committed-tailscale.vyxext" \
+            extensions/tailscale/dist/com.vyx.tailscale.vyxext
+          npm run typecheck -w @vyx/ai-extension
+          npm run build -w @vyx/ai-extension
+          cmp "${RUNNER_TEMP}/committed-ai.vyxext" \
+            extensions/ai/dist/com.vyx.ai.vyxext
+
+      - name: Pack complete author assets without lifecycle hooks
+        run: |
+          set -euo pipefail
+          install -d author-assets
+          cp extensions/tailscale/dist/com.vyx.tailscale.vyxext \
+            extensions/ai/dist/com.vyx.ai.vyxext author-assets/
+          npm pack -w @vyx/extension-sdk --ignore-scripts --json \
+            --pack-destination "${GITHUB_WORKSPACE}/author-assets" \
+            > "${RUNNER_TEMP}/sdk-pack.json"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import tarfile
+          import struct
+          packed = json.loads((pathlib.Path(os.environ["RUNNER_TEMP"]) / "sdk-pack.json").read_text())
+          assert len(packed) == 1, "expected exactly one SDK tarball"
+          filename = packed[0]["filename"]
+          assert pathlib.Path(filename).name == filename, "invalid npm tarball filename"
+          archive = pathlib.Path("author-assets") / filename
+          with tarfile.open(archive, "r:gz") as package:
+              files = {member.name for member in package.getmembers() if member.isfile()}
+          required = {
+              "package/package.json", "package/bin/vyx-extension.mjs",
+              "package/dist/index.js", "package/dist/index.d.ts",
+              "package/dist/manifest.js", "package/dist/manifest.d.ts",
+              "package/templates/index.ts",
+          }
+          sdk = pathlib.Path("packages/extension-sdk")
+          for directory in ("bin", "dist", "templates"):
+              required.update(
+                  f"package/{path.relative_to(sdk).as_posix()}"
+                  for path in (sdk / directory).rglob("*") if path.is_file()
+              )
+          assert required <= files, f"incomplete SDK tarball: {sorted(required - files)}"
+          archive.rename("author-assets/vyx-extension-sdk.tgz")
+          entries = []
+          for name in ("tailscale", "ai"):
+              package = pathlib.Path(f"author-assets/com.vyx.{name}.vyxext")
+              data = package.read_bytes()
+              assert data[:8] == b"VYXEXT1\n"
+              manifest_size, wasm_size = struct.unpack("<II", data[8:16])
+              assert len(data) == 16 + manifest_size + wasm_size
+              manifest = json.loads(data[16:16 + manifest_size])
+              entry = {
+                  "manifest": manifest, "asset": package.name,
+                  "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
+              }
+              index = json.loads(pathlib.Path(f"extensions/{name}/dist/vyx-extensions.json").read_text())
+              assert index == {"schemaVersion": 1, "extensions": [entry]}, \
+                  "release index must match the exact canonical package"
+              entries.append(entry)
+          pathlib.Path("author-assets/vyx-extensions.json").write_text(
+              json.dumps({"schemaVersion": 1, "extensions": entries}, separators=(",", ":"))
+          )
+          PY
+          sha256sum author-assets/*
+
+      - name: Exercise the SDK tarball as an external author
+        run: |
+          set -euo pipefail
+          consumer="${RUNNER_TEMP}/vyx-sdk-consumer"
+          archive="${GITHUB_WORKSPACE}/author-assets/vyx-extension-sdk.tgz"
+          install -d "$consumer"
+          npm --prefix "$consumer" install --ignore-scripts --no-audit --no-fund "$archive"
+          node "${consumer}/node_modules/@vyx/extension-sdk/bin/vyx-extension.mjs" \
+            init "${consumer}/project" --id org.example.release-smoke --sdk "$archive"
+          npm --prefix "${consumer}/project" install --ignore-scripts --no-audit --no-fund
+          npm --prefix "${consumer}/project" run typecheck
+          npm --prefix "${consumer}/project" run build
+          node "${consumer}/project/node_modules/@vyx/extension-sdk/bin/vyx-extension.mjs" \
+            pack --project "${consumer}/project" --out release/custom-browser.vyxext
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import struct
+
+          project = pathlib.Path(os.environ["RUNNER_TEMP"]) / "vyx-sdk-consumer/project"
+          for directory, asset in [
+              ("dist", "org.example.release-smoke.vyxext"),
+              ("release", "custom-browser.vyxext"),
+          ]:
+              package = (project / directory / asset).read_bytes()
+              manifest_size, wasm_size = struct.unpack("<II", package[8:16])
+              assert package[:8] == b"VYXEXT1\n" and len(package) == 16 + manifest_size + wasm_size
+              manifest = json.loads(package[16:16 + manifest_size])
+              assert manifest["id"] == "org.example.release-smoke"
+              assert json.loads((project / directory / "vyx-extensions.json").read_text()) == {
+                  "schemaVersion": 1,
+                  "extensions": [{
+                      "manifest": manifest, "asset": asset,
+                      "sha256": hashlib.sha256(package).hexdigest(), "size": len(package),
+                  }],
+              }
+          PY
+
+      - name: Upload canonical author assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-author-assets
+          path: author-assets/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  codex-helper:
+    name: Build optional tool-free Codex helper (${{ matrix.target }})
+    needs: validate-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install native helper build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            musl-tools cmake clang libclang-dev pkg-config perl make bubblewrap
+          rustup toolchain install 1.95.0 --profile minimal --target "${{ matrix.target }}"
+
+      - name: Build exact pinned source and verify static helper capabilities
+        run: |
+          set -euo pipefail
+          python3 scripts/build-codex-helper.py --native \
+            --work-dir "${RUNNER_TEMP}/codex-helper" --output dist --jobs 2
+
+      - name: Exercise isolated helper without an account or network
+        run: python3 scripts/codex-helper-smoke.py "dist/vyx-codex-${{ matrix.target }}"
+
+      - name: Upload separately delivered subscription helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-vyx-codex-${{ matrix.target }}
+          path: |
+            dist/vyx-codex-${{ matrix.target }}
+            dist/vyx-codex-LICENSE
+            dist/vyx-codex-NOTICE
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
   build:
     name: Build ${{ matrix.target }}
-    needs: validate-version
+    needs: author-assets
     permissions:
       contents: read
     strategy:
@@ -76,6 +284,20 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Download canonical extension package
+        uses: actions/download-artifact@v4
+        with:
+          name: extension-author-assets
+          path: canonical-author-assets
+
+      - name: Verify canonical package source correspondence
+        run: |
+          set -euo pipefail
+          cmp extensions/tailscale/dist/com.vyx.tailscale.vyxext \
+            canonical-author-assets/com.vyx.tailscale.vyxext
+          cmp extensions/ai/dist/com.vyx.ai.vyxext \
+            canonical-author-assets/com.vyx.ai.vyxext
+
       - name: Install native musl toolchain
         if: matrix.linux_musl
         env:
@@ -86,13 +308,8 @@ jobs:
           sudo apt-get install --yes --no-install-recommends musl-tools
           command -v musl-gcc
 
-          cargo_linker="CARGO_TARGET_${TARGET^^}_LINKER"
-          cargo_linker="${cargo_linker//-/_}"
           cc_target="CC_${TARGET//-/_}"
-          {
-            printf '%s=%s\n' "$cargo_linker" musl-gcc
-            printf '%s=%s\n' "$cc_target" musl-gcc
-          } >> "$GITHUB_ENV"
+          printf '%s=%s\n' "$cc_target" musl-gcc >> "$GITHUB_ENV"
 
       - name: Install Rust 1.98.1
         env:
@@ -104,21 +321,82 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Run locked workspace tests
+      - name: Select the bundled musl linker
+        if: matrix.linux_musl
         env:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          cargo test --workspace --locked --target "$TARGET"
+          cargo_linker="CARGO_TARGET_${TARGET^^}_LINKER"
+          cargo_linker="${cargo_linker//-/_}"
+          libdir="$(rustc --print target-libdir)"
+          printf '%s=%s\n' "$cargo_linker" "${libdir%/lib}/bin/rust-lld" >> "$GITHUB_ENV"
 
-      - name: Build optimized client
+      - name: Run locked workspace tests with the optional sandbox
         env:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          cargo build --package vyx --bin vyx --release --locked --target "$TARGET"
+          cargo test --workspace --locked --features extension-worker --target "$TARGET"
 
-      - name: Verify and stage native executable
+      - name: Build optimized optional worker
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo build --package vyx --bin vyx-extension-worker --features extension-worker \
+            --release --locked --target "$TARGET"
+
+      - name: Build standalone core without feature unification
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo build --package vyx --bin vyx --no-default-features --release --locked --target "$TARGET"
+
+      - name: Verify both standalone Linux executables
+        if: matrix.linux_musl
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          for name in vyx vyx-extension-worker; do
+            binary="target/${TARGET}/release/${name}"
+            headers="$(readelf --program-headers "$binary")"
+            dynamic="$(readelf --dynamic "$binary")"
+            if [[ "$headers" == *INTERP* || "$dynamic" == *"(NEEDED)"* ]]; then
+              printf '%s must not require a dynamic loader or shared libraries.\n' "$name" >&2
+              exit 1
+            fi
+            env -i PATH=/nonexistent "$binary" --version
+          done
+
+      - name: Exercise packaged extension on the native runtime
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          binary="target/${TARGET}/release/vyx"
+          env -i PATH=/nonexistent "$binary" --version
+          env -i PATH=/nonexistent "$binary" --help
+          python3 scripts/extension-smoke.py "$binary" "target/${TARGET}/release/vyx-extension-worker" \
+            canonical-author-assets/com.vyx.tailscale.vyxext \
+            | tee extension-runtime-smoke.json
+          {
+            printf '### Extension runtime: %s\n\n```json\n' "$TARGET"
+            cat extension-runtime-smoke.json
+            printf '```\n\nCurrent measurements only; no historical baseline delta is claimed.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload native runtime measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-runtime-${{ matrix.target }}
+          path: extension-runtime-smoke.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Verify and stage core and optional worker
         env:
           TARGET: ${{ matrix.target }}
           ASSET: ${{ matrix.asset }}
@@ -128,12 +406,17 @@ jobs:
           "$binary" --version
           install -d dist
           install -m 755 "$binary" "dist/${ASSET}"
+          worker="target/${TARGET}/release/vyx-extension-worker"
+          "$worker" --version
+          install -m 755 "$worker" "dist/vyx-extension-worker-${TARGET}"
 
-      - name: Upload native executable
+      - name: Upload core and optional worker
         uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}
+            dist/vyx-extension-worker-${{ matrix.target }}
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -141,7 +424,7 @@ jobs:
   assemble-release:
     name: Assemble release assets
     if: github.event_name == 'push'
-    needs: build
+    needs: [build, author-assets, codex-helper]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -158,6 +441,12 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Download canonical author assets
+        uses: actions/download-artifact@v4
+        with:
+          name: extension-author-assets
+          path: release-assets
+
       - name: Build complete release bundle
         run: |
           set -euo pipefail
@@ -166,6 +455,18 @@ jobs:
             vyx-aarch64-unknown-linux-musl
             vyx-x86_64-apple-darwin
             vyx-aarch64-apple-darwin
+            vyx-extension-worker-x86_64-unknown-linux-musl
+            vyx-extension-worker-aarch64-unknown-linux-musl
+            vyx-extension-worker-x86_64-apple-darwin
+            vyx-extension-worker-aarch64-apple-darwin
+            vyx-codex-x86_64-unknown-linux-musl
+            vyx-codex-aarch64-unknown-linux-musl
+            vyx-codex-LICENSE
+            vyx-codex-NOTICE
+            vyx-extension-sdk.tgz
+            com.vyx.tailscale.vyxext
+            com.vyx.ai.vyxext
+            vyx-extensions.json
           )
 
           for asset in "${assets[@]}"; do
@@ -189,6 +490,18 @@ jobs:
             release-assets/vyx-aarch64-unknown-linux-musl
             release-assets/vyx-x86_64-apple-darwin
             release-assets/vyx-aarch64-apple-darwin
+            release-assets/vyx-extension-worker-x86_64-unknown-linux-musl
+            release-assets/vyx-extension-worker-aarch64-unknown-linux-musl
+            release-assets/vyx-extension-worker-x86_64-apple-darwin
+            release-assets/vyx-extension-worker-aarch64-apple-darwin
+            release-assets/vyx-codex-x86_64-unknown-linux-musl
+            release-assets/vyx-codex-aarch64-unknown-linux-musl
+            release-assets/vyx-codex-LICENSE
+            release-assets/vyx-codex-NOTICE
+            release-assets/vyx-extension-sdk.tgz
+            release-assets/com.vyx.tailscale.vyxext
+            release-assets/com.vyx.ai.vyxext
+            release-assets/vyx-extensions.json
             release-assets/SHA256SUMS
             release-assets/install.sh
           if-no-files-found: error
@@ -221,6 +534,18 @@ jobs:
             vyx-aarch64-unknown-linux-musl
             vyx-x86_64-apple-darwin
             vyx-aarch64-apple-darwin
+            vyx-extension-worker-x86_64-unknown-linux-musl
+            vyx-extension-worker-aarch64-unknown-linux-musl
+            vyx-extension-worker-x86_64-apple-darwin
+            vyx-extension-worker-aarch64-apple-darwin
+            vyx-codex-x86_64-unknown-linux-musl
+            vyx-codex-aarch64-unknown-linux-musl
+            vyx-codex-LICENSE
+            vyx-codex-NOTICE
+            vyx-extension-sdk.tgz
+            com.vyx.tailscale.vyxext
+            com.vyx.ai.vyxext
+            vyx-extensions.json
             SHA256SUMS
             install.sh
           )
@@ -230,6 +555,10 @@ jobs:
             test -s "$path"
             paths+=("$path")
           done
+          (
+            cd release-assets
+            sha256sum --check --strict SHA256SUMS
+          )
 
           if release_state="$(gh release view "$RELEASE_TAG" \
             --repo "$REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null)"; then

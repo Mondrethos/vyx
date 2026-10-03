@@ -3,10 +3,20 @@ name = "vyx"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+default-run = "vyx"
 
 [[bin]]
 name = "vyx"
 path = "src/main.rs"
+
+[[bin]]
+name = "vyx-extension-worker"
+path = "src/bin/vyx-extension-worker.rs"
+required-features = ["extension-worker"]
+
+[features]
+default = []
+extension-worker = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
 [dependencies]
 anyhow = "1"
@@ -20,8 +30,8 @@ directories = "6"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await", "sink"] }
 libc = "0.2"
 parking_lot = "0.12"
-# Publish each complete IPC frame through the pinned backend's buffered writer.
-ratatui = { version = "=0.30.0", default-features = false, features = ["crossterm", "unstable-backend-writer"] }
+# The pinned backend exposes buffered output and exact wrapped form heights.
+ratatui = { version = "=0.30.0", default-features = false, features = ["crossterm", "unstable-backend-writer", "unstable-rendered-line-info"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider", "stream"] }
 russh = { version = "=0.63.3", default-features = false, features = ["ring", "rsa"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -31,9 +41,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
-tui-term = { version = "=0.3.4", default-features = false, features = ["vt100"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "sync", "time", "signal", "fs", "process"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 vt100 = "=0.16.2"
+wasmtime = { version = "=49.0.1", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "anyhow"] }
+wasmtime-wasi = { version = "=49.0.1", optional = true, default-features = false, features = ["p1"] }
 vte = "=0.15.0"
 zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+wat = "=1.258.0"
+

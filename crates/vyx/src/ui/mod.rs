@@ -1,4 +1,17 @@
 pub mod actions;
+pub mod ai;
+pub mod animation;
 pub mod catalog;
+pub mod extensions;
 pub mod form;
+pub mod icons;
+pub mod lock;
+pub mod menu;
 pub mod render;
+pub mod security;
+pub mod setup;
+pub mod shortcuts;
+pub mod terminal_layout;
+pub mod themes;
+pub mod theming;
+pub mod widgets;

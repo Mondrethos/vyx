@@ -227,7 +227,7 @@ fn platform_asset() -> Result<&'static str> {
     }
 }
 
-fn api_client() -> Result<Client> {
+pub(crate) fn api_client() -> Result<Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     Client::builder()
         .user_agent(USER_AGENT)
@@ -238,7 +238,13 @@ fn api_client() -> Result<Client> {
         .context("initialize the GitHub release client")
 }
 
-fn download_client() -> Result<Client> {
+pub(crate) fn download_client() -> Result<Client> {
+    download_client_builder()
+        .build()
+        .context("initialize the GitHub download client")
+}
+
+pub(crate) fn download_client_builder() -> reqwest::ClientBuilder {
     Client::builder()
         .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
@@ -254,11 +260,9 @@ fn download_client() -> Result<Client> {
         }))
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(DOWNLOAD_TIMEOUT)
-        .build()
-        .context("initialize the GitHub download client")
 }
 
-fn approved_download_host(url: &Url) -> bool {
+pub(crate) fn approved_download_host(url: &Url) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
@@ -379,7 +383,7 @@ fn select_asset(
     })
 }
 
-async fn read_bounded(response: Response, limit: usize, description: &str) -> Result<Vec<u8>> {
+pub(crate) async fn read_bounded(response: Response, limit: usize, description: &str) -> Result<Vec<u8>> {
     ensure!(
         response
             .content_length()
@@ -444,7 +448,7 @@ async fn fetch_asset_response(
     Ok(response)
 }
 
-fn parse_checksums(bytes: &[u8], selected_asset: &str) -> Result<[u8; 32]> {
+pub(crate) fn parse_checksums(bytes: &[u8], selected_asset: &str) -> Result<[u8; 32]> {
     ensure!(
         !bytes.is_empty() && bytes.len() <= MAX_CHECKSUMS,
         "invalid SHA256SUMS size"
@@ -495,7 +499,7 @@ fn valid_asset_basename(name: &str) -> bool {
             .all(|byte| byte.is_ascii_graphic() && byte != b'/' && byte != b'\\' && byte != b':')
 }
 
-fn decode_sha256(value: &str) -> Result<[u8; 32]> {
+pub(crate) fn decode_sha256(value: &str) -> Result<[u8; 32]> {
     ensure!(
         value.len() == 64
             && value

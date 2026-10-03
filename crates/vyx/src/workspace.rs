@@ -39,7 +39,7 @@ use tokio::{
 use crate::screen::TerminalGuard;
 
 const PROTOCOL_MAGIC: &[u8; 4] = b"VYXW";
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = 3;
 const HEADER_LEN: usize = 12;
 
 const KIND_HELLO: u8 = 1;
@@ -52,6 +52,8 @@ const KIND_CLIENT_DETACH: u8 = 7;
 const KIND_RENDER: u8 = 8;
 const KIND_DETACHED: u8 = 9;
 const KIND_FINISHED: u8 = 10;
+const KIND_CONNECT: u8 = 11;
+const KIND_CLIENT_SHUTDOWN: u8 = 12;
 
 const MAX_DIMENSION: u16 = 4096;
 const MAX_CELLS: u32 = 65_536;
@@ -70,6 +72,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const FRAME_WRITE_TIMEOUT: Duration = Duration::from_millis(750);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_ONLY_TIMEOUT: Duration = Duration::from_millis(600);
+const WORKER_ORPHAN_TIMEOUT: Duration = Duration::from_secs(7);
 const RETRY_INTERVAL: Duration = Duration::from_millis(40);
 const FINISH_TIMEOUT: Duration = Duration::from_secs(2);
 const REAP_TIMEOUT: Duration = Duration::from_secs(1);
@@ -82,6 +85,7 @@ pub enum WorkspaceEvent {
     Attached(u16, u16),
     Detached,
     Input(Event),
+    Connect(String),
 }
 
 pub struct DisplayWriter {
@@ -117,6 +121,8 @@ struct Shared {
 struct SharedState {
     current: Option<Attachment>,
     finishing: bool,
+    ever_attached: bool,
+    input_generation: u64,
 }
 
 struct Attachment {
@@ -128,7 +134,8 @@ struct Attachment {
 
 struct InboundEvent {
     attachment: u64,
-    event: Event,
+    input_generation: u64,
+    event: WorkspaceEvent,
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +168,20 @@ struct Session {
     stream: UnixStream,
     output: mpsc::Receiver<Outbound>,
     control: watch::Receiver<SessionControl>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReaderEnd {
+    Detached,
+    Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriterEnd {
+    Detached,
+    Finished,
+    Shutdown,
+    Failed,
 }
 
 struct Frame {
@@ -215,6 +236,8 @@ impl Workspace {
             state: Mutex::new(SharedState {
                 current: None,
                 finishing: false,
+                ever_attached: false,
+                input_generation: 0,
             }),
             events: event_sender,
             lifecycle: lifecycle_sender,
@@ -267,12 +290,17 @@ impl Workspace {
                 }
                 incoming = self.events.recv() => {
                     let incoming = incoming?;
-                    if self.shared.is_current(incoming.attachment) {
-                        return Some(WorkspaceEvent::Input(incoming.event));
+                    if self.shared.accepts(&incoming) {
+                        return Some(incoming.event);
                     }
                 }
             }
         }
+    }
+
+    pub(crate) fn fence_authentication_input(&mut self) {
+        let mut state = self.shared.lock();
+        state.input_generation = state.input_generation.wrapping_add(1);
     }
 
     pub fn is_attached(&self) -> bool {
@@ -298,17 +326,17 @@ impl Workspace {
                 .await
                 .is_err()
             {
-                self.shared.detach_if(attachment);
+                self.shared.clear_if(attachment);
             } else {
                 let mut lifecycle = self.shared.lifecycle.subscribe();
-                let wait_for_detach = async {
-                    while self.shared.is_current(attachment) {
+                let wait_for_session = async {
+                    while self.shared.contains_attachment(attachment) {
                         if lifecycle.changed().await.is_err() {
                             break;
                         }
                     }
                 };
-                let _ = timeout(FINISH_TIMEOUT, wait_for_detach).await;
+                let _ = timeout(FINISH_TIMEOUT, wait_for_session).await;
             }
         }
 
@@ -359,10 +387,11 @@ impl DisplayWriter {
             return;
         }
 
-        // A burst of redraws must backpressure, not discard a delta or detach a fast reader.
+        // A burst of redraws must backpressure, not discard a delta. A closed output path means
+        // the attached frontend is gone and must terminate this worker rather than detach it.
         let frame = std::mem::replace(&mut self.pending, Vec::with_capacity(16 * 1024));
         if output.send(Outbound::Render(frame)).await.is_err() {
-            self.shared.detach_if(attachment);
+            self.shared.shutdown_if(attachment);
         }
     }
 }
@@ -386,13 +415,13 @@ impl Write for DisplayWriter {
         let Some(new_length) = self.pending.len().checked_add(bytes.len()) else {
             self.pending.clear();
             self.attachment = None;
-            self.shared.detach_if(attachment);
+            self.shared.shutdown_if(attachment);
             return Ok(bytes.len());
         };
         if new_length > MAX_RENDER_PAYLOAD {
             self.pending.clear();
             self.attachment = None;
-            self.shared.detach_if(attachment);
+            self.shared.shutdown_if(attachment);
             return Ok(bytes.len());
         }
         self.pending.extend_from_slice(bytes);
@@ -430,15 +459,18 @@ impl Shared {
             output,
             control,
         });
+        state.ever_attached = true;
         self.lifecycle.send_replace(Lifecycle {
             attachment: id,
             state: LifecycleState::Attached(columns, rows),
         });
         Ok(id)
     }
-
     fn announce(&self, attachment: u64) -> bool {
         let mut state = self.lock();
+        if state.finishing {
+            return false;
+        }
         let Some(current) = state.current.as_mut() else {
             return false;
         };
@@ -450,13 +482,24 @@ impl Shared {
     }
 
     fn is_attached(&self) -> bool {
-        self.lock()
-            .current
-            .as_ref()
-            .is_some_and(|current| current.announced)
+        let state = self.lock();
+        !state.finishing
+            && state
+                .current
+                .as_ref()
+                .is_some_and(|current| current.announced)
     }
 
-    fn is_current(&self, attachment: u64) -> bool {
+    fn accepts(&self, incoming: &InboundEvent) -> bool {
+        let state = self.lock();
+        !state.finishing
+            && state.current.as_ref().is_some_and(|current| current.id == incoming.attachment)
+            && (incoming.input_generation == state.input_generation
+                || !matches!(&incoming.event,
+                    WorkspaceEvent::Input(Event::Key(_) | Event::Paste(_) | Event::Mouse(_))))
+    }
+
+    fn contains_attachment(&self, attachment: u64) -> bool {
         self.lock()
             .current
             .as_ref()
@@ -464,21 +507,29 @@ impl Shared {
     }
 
     fn output_target(&self) -> Option<(u64, mpsc::Sender<Outbound>)> {
-        self.lock().current.as_ref().and_then(|current| {
+        let state = self.lock();
+        if state.finishing {
+            return None;
+        }
+        state.current.as_ref().and_then(|current| {
             current
                 .announced
                 .then(|| (current.id, current.output.clone()))
         })
     }
 
-    async fn submit_event(&self, attachment: u64, event: Event) -> bool {
-        if !self.is_current(attachment) {
-            return false;
-        }
-        // Keep input bounded without disconnecting normal typing bursts. The receiver
-        // checks the attachment again, fencing queued input if this sender becomes stale.
+    async fn submit_event(&self, attachment: u64, event: WorkspaceEvent) -> bool {
+        let input_generation = {
+            let state = self.lock();
+            if state.finishing || !state.current.as_ref().is_some_and(|current| current.id == attachment) {
+                return false;
+            }
+            state.input_generation
+        };
+        // Stamp before awaiting queue capacity: a sender blocked during authentication
+        // belongs to the old input generation even if it is enqueued after the handoff.
         self.events
-            .send(InboundEvent { attachment, event })
+            .send(InboundEvent { attachment, input_generation, event })
             .await
             .is_ok()
     }
@@ -493,10 +544,11 @@ impl Shared {
     fn detach_if(&self, attachment: u64) {
         let detached = {
             let mut state = self.lock();
-            if state
-                .current
-                .as_ref()
-                .is_some_and(|current| current.id == attachment)
+            if !state.finishing
+                && state
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| current.id == attachment)
             {
                 state.current.take()
             } else {
@@ -509,6 +561,70 @@ impl Shared {
                 state: LifecycleState::Detached,
             });
             detached.control.send_replace(SessionControl::Detach);
+        }
+    }
+
+    fn shutdown_if(&self, attachment: u64) {
+        let shutdown = {
+            let mut state = self.lock();
+            let current = state
+                .current
+                .as_ref()
+                .is_some_and(|current| current.id == attachment);
+            if current {
+                state.finishing = true;
+            }
+            current
+        };
+        if shutdown {
+            self.lifecycle.send_replace(Lifecycle {
+                attachment,
+                state: LifecycleState::Finished,
+            });
+        }
+    }
+
+    fn awaits_first_attachment(&self) -> bool {
+        let state = self.lock();
+        !state.ever_attached && state.current.is_none() && !state.finishing
+    }
+
+    fn shutdown_unattached(&self) -> bool {
+        let shutdown = {
+            let mut state = self.lock();
+            if state.ever_attached || state.current.is_some() || state.finishing {
+                false
+            } else {
+                state.finishing = true;
+                true
+            }
+        };
+        if shutdown {
+            self.lifecycle.send_replace(Lifecycle {
+                attachment: 0,
+                state: LifecycleState::Finished,
+            });
+        }
+        shutdown
+    }
+
+    fn clear_if(&self, attachment: u64) {
+        let finished = {
+            let mut state = self.lock();
+            let current = state
+                .current
+                .as_ref()
+                .is_some_and(|current| current.id == attachment);
+            if current {
+                state.current.take();
+            }
+            current && state.finishing
+        };
+        if finished {
+            self.lifecycle.send_replace(Lifecycle {
+                attachment,
+                state: LifecycleState::Finished,
+            });
         }
     }
 
@@ -547,11 +663,18 @@ async fn listener_loop(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut sessions = JoinSet::new();
+    let orphan_timeout = sleep(WORKER_ORPHAN_TIMEOUT);
+    tokio::pin!(orphan_timeout);
     loop {
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = &mut orphan_timeout, if shared.awaits_first_attachment() => {
+                if shared.shutdown_unattached() {
                     break;
                 }
             }
@@ -639,7 +762,8 @@ async fn accept_client(mut stream: UnixStream, shared: &Arc<Shared>) -> Option<S
             .await
             .is_err()
             {
-                shared.detach_if(id);
+                shared.shutdown_if(id);
+                shared.clear_if(id);
                 return None;
             }
             Some(Session {
@@ -670,27 +794,53 @@ async fn run_session(session: Session, shared: Arc<Shared>, mut shutdown: watch:
     } = session;
     let (reader, writer) = stream.into_split();
     let reader_shared = Arc::clone(&shared);
-    let mut reader_task = tokio::spawn(async move {
-        server_reader(reader, id, reader_shared).await;
-    });
-    let mut writer_task = tokio::spawn(async move {
-        server_writer(writer, output, control).await;
-    });
+    let mut reader_task =
+        tokio::spawn(async move { server_reader(reader, id, reader_shared).await });
+    let mut writer_task =
+        tokio::spawn(async move { server_writer(writer, output, control).await });
 
-    let (reader_done, mut writer_done) = tokio::select! {
-        _ = &mut reader_task => (true, false),
-        _ = &mut writer_task => (false, true),
+    enum FirstEnd {
+        Reader(ReaderEnd),
+        Writer(WriterEnd),
+        Listener,
+    }
+
+    let first = tokio::select! {
+        result = &mut reader_task => {
+            FirstEnd::Reader(result.unwrap_or(ReaderEnd::Shutdown))
+        }
+        result = &mut writer_task => {
+            FirstEnd::Writer(result.unwrap_or(WriterEnd::Failed))
+        }
         changed = shutdown.changed() => {
             let _ = changed;
-            (false, false)
+            FirstEnd::Listener
         }
     };
-    if reader_done {
-        shared.detach_if(id);
-        if timeout(FINISH_TIMEOUT, &mut writer_task).await.is_ok() {
-            writer_done = true;
+    let reader_done = matches!(&first, FirstEnd::Reader(_));
+    let mut writer_done = matches!(&first, FirstEnd::Writer(_));
+
+    match first {
+        FirstEnd::Reader(ReaderEnd::Detached) => {
+            shared.detach_if(id);
+            if timeout(FINISH_TIMEOUT, &mut writer_task).await.is_ok() {
+                writer_done = true;
+            }
         }
+        FirstEnd::Reader(ReaderEnd::Shutdown) => {
+            shared.shutdown_if(id);
+            tokio::select! {
+                _ = &mut writer_task => writer_done = true,
+                changed = shutdown.changed() => {
+                    let _ = changed;
+                }
+            }
+        }
+        FirstEnd::Writer(WriterEnd::Detached) => shared.detach_if(id),
+        FirstEnd::Writer(WriterEnd::Failed) => shared.shutdown_if(id),
+        FirstEnd::Writer(WriterEnd::Finished | WriterEnd::Shutdown) | FirstEnd::Listener => {}
     }
+
     if !reader_done {
         reader_task.abort();
         let _ = reader_task.await;
@@ -699,31 +849,51 @@ async fn run_session(session: Session, shared: Arc<Shared>, mut shutdown: watch:
         writer_task.abort();
         let _ = writer_task.await;
     }
-    shared.detach_if(id);
+    shared.clear_if(id);
 }
 
-async fn server_reader(mut reader: OwnedReadHalf, attachment: u64, shared: Arc<Shared>) {
+async fn server_reader(
+    mut reader: OwnedReadHalf,
+    attachment: u64,
+    shared: Arc<Shared>,
+) -> ReaderEnd {
     loop {
         let frame = match read_frame(&mut reader, MAX_EVENT_PAYLOAD).await {
             Ok(Some(frame)) => frame,
-            Ok(None) | Err(_) => return,
+            Ok(None) | Err(_) => return ReaderEnd::Shutdown,
         };
         if frame.version != PROTOCOL_VERSION {
-            return;
+            return ReaderEnd::Shutdown;
         }
         match frame.kind {
             KIND_EVENT => {
                 let event: Event = match serde_json::from_slice(&frame.payload) {
                     Ok(event) => event,
-                    Err(_) => return,
+                    Err(_) => return ReaderEnd::Shutdown,
                 };
-                if validate_event(&event).is_err() || !shared.submit_event(attachment, event).await
+                if validate_event(&event).is_err()
+                    || !shared
+                        .submit_event(attachment, WorkspaceEvent::Input(event))
+                        .await
                 {
-                    return;
+                    return ReaderEnd::Shutdown;
                 }
             }
-            KIND_CLIENT_DETACH if frame.payload.is_empty() => return,
-            _ => return,
+            KIND_CONNECT => {
+                let server = match String::from_utf8(frame.payload) {
+                    Ok(server) if !server.is_empty() => server,
+                    _ => return ReaderEnd::Shutdown,
+                };
+                if !shared
+                    .submit_event(attachment, WorkspaceEvent::Connect(server))
+                    .await
+                {
+                    return ReaderEnd::Shutdown;
+                }
+            }
+            KIND_CLIENT_DETACH if frame.payload.is_empty() => return ReaderEnd::Detached,
+            KIND_CLIENT_SHUTDOWN if frame.payload.is_empty() => return ReaderEnd::Shutdown,
+            _ => return ReaderEnd::Shutdown,
         }
     }
 }
@@ -732,48 +902,66 @@ async fn server_writer(
     mut writer: OwnedWriteHalf,
     mut output: mpsc::Receiver<Outbound>,
     mut control: watch::Receiver<SessionControl>,
-) {
+) -> WriterEnd {
     loop {
         tokio::select! {
             biased;
             changed = control.changed() => {
                 if changed.is_err() {
-                    return;
+                    return WriterEnd::Shutdown;
                 }
                 let command = *control.borrow_and_update();
                 match command {
                     SessionControl::Running => {}
                     SessionControl::Detach => {
                         let _ = write_frame_timeout(&mut writer, KIND_DETACHED, &[]).await;
-                        return;
+                        return WriterEnd::Detached;
                     }
-                    SessionControl::Shutdown => return,
+                    SessionControl::Shutdown => return WriterEnd::Shutdown,
                 }
             }
             message = output.recv() => {
                 match message {
                     Some(Outbound::Render(bytes)) => {
                         if write_frame_timeout(&mut writer, KIND_RENDER, &bytes).await.is_err() {
-                            return;
+                            return WriterEnd::Failed;
                         }
                     }
                     Some(Outbound::Finish(error)) => {
                         let payload = encode_finish(error.as_deref());
-                        let _ = write_frame_timeout(&mut writer, KIND_FINISHED, &payload).await;
-                        return;
+                        return if write_frame_timeout(&mut writer, KIND_FINISHED, &payload)
+                            .await
+                            .is_ok()
+                        {
+                            WriterEnd::Finished
+                        } else {
+                            WriterEnd::Failed
+                        };
                     }
-                    None => return,
+                    None => return WriterEnd::Shutdown,
                 }
             }
         }
     }
 }
 
-pub async fn connect(data_dir: &Path, restore: Option<&Path>, attach_only: bool) -> Result<()> {
+pub async fn connect(
+    data_dir: &Path,
+    restore: Option<&Path>,
+    attach_only: bool,
+    server: Option<&str>,
+) -> Result<()> {
     ensure!(
         !(restore.is_some() && attach_only),
         "Restore cannot be combined with attach-only mode"
     );
+    if let Some(server) = server {
+        ensure!(
+            !server.is_empty() && server.len() <= MAX_EVENT_PAYLOAD,
+            "Saved-server name must be nonempty and fit within the local-workspace message limit"
+        );
+        ensure!(restore.is_none(), "Restore cannot be combined with a saved-server name");
+    }
     let data_dir = prepare_data_directory(data_dir)?;
     let endpoint = endpoint_for(&data_dir)?;
     let restore = restore.map(canonical_restore_file).transpose()?;
@@ -798,7 +986,7 @@ pub async fn connect(data_dir: &Path, restore: Option<&Path>, attach_only: bool)
                 stream,
                 worker_pid: _,
             }) => {
-                return run_frontend(stream, &data_dir, None).await;
+                return run_frontend(stream, &data_dir, None, server).await;
             }
             Ok(HandshakeResult::Running(_)) => {
                 bail!("Invalid response from the local vyx workspace")
@@ -817,7 +1005,7 @@ pub async fn connect(data_dir: &Path, restore: Option<&Path>, attach_only: bool)
                     stream,
                     worker_pid: _,
                 }) => {
-                    return run_frontend(stream, &data_dir, None).await;
+                    return run_frontend(stream, &data_dir, None, server).await;
                 }
                 Ok(HandshakeResult::Running(_)) => {
                     bail!("Invalid response from the local vyx workspace")
@@ -837,18 +1025,26 @@ pub async fn connect(data_dir: &Path, restore: Option<&Path>, attach_only: bool)
     let mut child = spawn_worker(&data_dir, restore.as_deref())?;
     let child_pid = child.id();
     let deadline = Instant::now() + STARTUP_TIMEOUT;
-    let stream = loop {
+    let (stream, owns_attached_worker) = loop {
         if restore.is_some() {
             match probe_once(&endpoint).await {
                 Ok(HandshakeResult::Running(pid)) if pid == child_pid => {
                     match attach_once(&endpoint).await {
-                        Ok(HandshakeResult::Attached { stream, worker_pid })
-                            if worker_pid == child_pid =>
-                        {
-                            break stream;
-                        }
-                        Ok(HandshakeResult::Attached { mut stream, .. }) => {
-                            let _ = write_frame_timeout(&mut stream, KIND_CLIENT_DETACH, &[]).await;
+                        Ok(HandshakeResult::Attached {
+                            mut stream,
+                            worker_pid,
+                        }) => {
+                            if worker_pid == child_pid
+                                && child
+                                    .try_wait()
+                                    .context("verify workspace worker ownership")?
+                                    .is_none()
+                            {
+                                break (stream, true);
+                            }
+                            let _ =
+                                write_frame_timeout(&mut stream, KIND_CLIENT_DETACH, &[]).await;
+                            reap_competing_child(&mut child).await?;
                             bail!("Restore refuses to attach to a different running workspace");
                         }
                         Ok(HandshakeResult::Running(_)) => {
@@ -860,6 +1056,7 @@ pub async fn connect(data_dir: &Path, restore: Option<&Path>, attach_only: bool)
                     }
                 }
                 Ok(HandshakeResult::Running(_)) | Ok(HandshakeResult::Attached { .. }) => {
+                    reap_competing_child(&mut child).await?;
                     bail!("Restore refuses to attach to a different running workspace")
                 }
                 Err(ConnectFailure::Unavailable) => {}
@@ -868,11 +1065,24 @@ pub async fn connect(data_dir: &Path, restore: Option<&Path>, attach_only: bool)
             }
         } else {
             match attach_once(&endpoint).await {
-                Ok(HandshakeResult::Attached { stream, worker_pid }) => {
-                    if worker_pid != child_pid {
-                        reap_child(&mut child).await;
+                Ok(HandshakeResult::Attached {
+                    mut stream,
+                    worker_pid,
+                }) => {
+                    let owns_worker = worker_pid == child_pid
+                        && child
+                            .try_wait()
+                            .context("verify workspace worker ownership")?
+                            .is_none();
+                    if owns_worker {
+                        break (stream, true);
                     }
-                    break stream;
+                    if let Err(error) = reap_competing_child(&mut child).await {
+                        let _ =
+                            write_frame_timeout(&mut stream, KIND_CLIENT_DETACH, &[]).await;
+                        return Err(error);
+                    }
+                    break (stream, false);
                 }
                 Ok(HandshakeResult::Running(_)) => {
                     bail!("Invalid response from the local vyx workspace")
@@ -887,17 +1097,23 @@ pub async fn connect(data_dir: &Path, restore: Option<&Path>, attach_only: bool)
             if restore.is_some() {
                 return Err(worker_exit_error(status));
             }
-            break await_racing_worker(&endpoint, status).await?;
+            break (await_racing_worker(&endpoint, status).await?, false);
         }
 
         if Instant::now() >= deadline {
+            wait_child_exit(&mut child).await?;
             bail!("Timed out waiting for the local vyx workspace worker to start");
         }
         sleep(RETRY_INTERVAL).await;
     };
 
-    let result = run_frontend(stream, &data_dir, Some(&mut child)).await;
-    result
+    run_frontend(
+        stream,
+        &data_dir,
+        owns_attached_worker.then_some(&mut child),
+        server,
+    )
+    .await
 }
 
 async fn await_racing_worker(endpoint: &Path, child_status: ExitStatus) -> Result<UnixStream> {
@@ -1004,7 +1220,7 @@ async fn handshake_once(
     };
     if response.version != PROTOCOL_VERSION {
         return Err(ConnectFailure::Refused(
-            "The running vyx workspace uses an incompatible protocol version".to_owned(),
+            "The running vyx workspace uses an incompatible protocol version. Quit it with the previous executable (Ctrl+B then q by default), then retry.".to_owned(),
         ));
     }
     match response.kind {
@@ -1033,25 +1249,67 @@ async fn run_frontend(
     stream: UnixStream,
     data_dir: &Path,
     mut owned_child: Option<&mut Child>,
+    server: Option<&str>,
 ) -> Result<()> {
+    let setup = (|| -> Result<_> {
+        let events = EventStream::new();
+        let interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        let terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+        let quit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit())?;
+        let guard = TerminalGuard::enter()?;
+        // SIGWINCH is now subscribed; repair a resize that happened during the handshake.
+        let dimensions = crossterm::terminal::size().context("read terminal dimensions")?;
+        Ok((
+            events, interrupt, terminate, hangup, quit, guard, dimensions,
+        ))
+    })();
+    let (
+        mut events,
+        mut interrupt,
+        mut terminate,
+        mut hangup,
+        mut quit,
+        guard,
+        (columns, rows),
+    ) = match setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            drop(stream);
+            if let Some(child) = owned_child.as_mut() {
+                wait_child_exit(child).await?;
+            }
+            return Err(error);
+        }
+    };
     let (reader, mut writer) = stream.into_split();
-    let mut events = EventStream::new();
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
-    let mut quit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit())?;
-    let guard = TerminalGuard::enter()?;
-    // SIGWINCH is now subscribed; repair a resize that happened during the handshake.
-    let (columns, rows) = crossterm::terminal::size().context("read terminal dimensions")?;
-    send_event(&mut writer, Event::Resize(columns, rows)).await?;
+    let setup_result: Result<()> = async {
+        if let Some(server) = server {
+            write_frame_timeout(&mut writer, KIND_CONNECT, server.as_bytes()).await?;
+        }
+        send_event(&mut writer, Event::Resize(columns, rows)).await
+    }
+    .await;
+    if let Err(error) = setup_result {
+        drop(reader);
+        drop(writer);
+        drop(events);
+        drop(guard);
+        if let Some(child) = owned_child.as_mut() {
+            wait_child_exit(child).await?;
+        }
+        return Err(error);
+    }
 
-    // Start the owned framing reader only after every fallible frontend setup step. If setup
-    // fails, both socket halves are dropped here and the worker observes a normal detach.
+    // Start the framing reader only after every fallible frontend setup step. Any later
+    // connection loss is a worker-shutdown request unless the user explicitly detached.
     let (frames_sender, mut frames) = mpsc::channel(CLIENT_FRAME_QUEUE_CAPACITY);
     let mut reader_task = tokio::spawn(frontend_reader(reader, frames_sender));
 
     let mut reader_done = false;
-    let outcome = loop {
+    let mut outcome = loop {
         tokio::select! {
             biased;
             frame = frames.recv() => {
@@ -1097,16 +1355,36 @@ async fn run_frontend(
         }
     };
 
+    drop(events);
+    drop(guard);
+    if matches!(&outcome, FrontendExit::External) {
+        outcome = match write_frame_timeout(&mut writer, KIND_CLIENT_SHUTDOWN, &[]).await {
+            Ok(()) => {
+                let (confirmed, finished_reader) =
+                    await_shutdown_confirmation(&mut frames, &mut reader_task).await;
+                reader_done |= finished_reader;
+                confirmed
+            }
+            Err(error) => FrontendExit::Failed(
+                error.context("request shutdown after terminal frontend exit"),
+            ),
+        };
+    }
+
     if !reader_done {
         reader_task.abort();
         let _ = reader_task.await;
     }
-    drop(events);
-    drop(guard);
-    if matches!(&outcome, FrontendExit::External) {
-        let _ = write_frame_timeout(&mut writer, KIND_CLIENT_DETACH, &[]).await;
-    }
     drop(writer);
+
+    match (&outcome, owned_child.as_mut()) {
+        (FrontendExit::Detached, _) => {}
+        (_, Some(child)) => {
+            wait_child_exit(child).await?;
+        }
+        (FrontendExit::Finished(_), None) => wait_workspace_release(data_dir).await?,
+        (FrontendExit::External | FrontendExit::Failed(_), None) => {}
+    }
 
     match outcome {
         FrontendExit::Detached => {
@@ -1116,17 +1394,61 @@ async fn run_frontend(
             );
             Ok(())
         }
-        FrontendExit::External => Ok(()),
-        FrontendExit::Finished(error) => {
-            if let Some(child) = owned_child.as_mut() {
-                reap_child(child).await;
+        FrontendExit::Finished(error) => match error {
+            Some(error) => Err(anyhow!(error).context("Workspace worker stopped")),
+            None => Ok(()),
+        },
+        FrontendExit::Failed(error) => Err(error),
+        FrontendExit::External => Err(anyhow!("Workspace shutdown was not confirmed")),
+    }
+}
+
+async fn await_shutdown_confirmation(
+    frames: &mut mpsc::Receiver<Frame>,
+    reader_task: &mut JoinHandle<Result<()>>,
+) -> (FrontendExit, bool) {
+    loop {
+        let Some(frame) = frames.recv().await else {
+            let outcome = match (&mut *reader_task).await {
+                Ok(Ok(())) => {
+                    FrontendExit::Failed(anyhow!("The workspace worker stopped unexpectedly"))
+                }
+                Ok(Err(error)) => {
+                    FrontendExit::Failed(error.context("read from the workspace worker"))
+                }
+                Err(error) => {
+                    FrontendExit::Failed(anyhow!(error).context("workspace reader failed"))
+                }
+            };
+            return (outcome, true);
+        };
+        if frame.version != PROTOCOL_VERSION {
+            return (
+                FrontendExit::Failed(anyhow!(
+                    "Workspace protocol version changed during attachment"
+                )),
+                false,
+            );
+        }
+        match frame.kind {
+            KIND_RENDER if frame.payload.len() <= MAX_RENDER_PAYLOAD => {}
+            KIND_DETACHED if frame.payload.is_empty() => {
+                return (FrontendExit::Detached, false);
             }
-            match error {
-                Some(error) => Err(anyhow!(error).context("Workspace worker stopped")),
-                None => Ok(()),
+            KIND_FINISHED => {
+                let outcome = match decode_finish(&frame.payload) {
+                    Ok(error) => FrontendExit::Finished(error),
+                    Err(error) => FrontendExit::Failed(error),
+                };
+                return (outcome, false);
+            }
+            _ => {
+                return (
+                    FrontendExit::Failed(anyhow!("Unexpected frame from the workspace worker")),
+                    false,
+                );
             }
         }
-        FrontendExit::Failed(error) => Err(error),
     }
 }
 
@@ -1581,15 +1903,39 @@ fn worker_exit_error(status: ExitStatus) -> anyhow::Error {
     anyhow!("The local vyx workspace worker exited before attachment ({status})")
 }
 
-async fn reap_child(child: &mut Child) {
-    let deadline = Instant::now() + REAP_TIMEOUT;
+async fn wait_child_exit(child: &mut Child) -> Result<ExitStatus> {
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) if Instant::now() < deadline => sleep(Duration::from_millis(20)).await,
-            Ok(None) => return,
+        if let Some(status) = child.try_wait().context("inspect workspace worker")? {
+            return Ok(status);
         }
+        sleep(Duration::from_millis(20)).await;
     }
+}
+
+async fn reap_competing_child(child: &mut Child) -> Result<()> {
+    timeout(REAP_TIMEOUT, wait_child_exit(child))
+        .await
+        .context("Competing workspace worker did not exit promptly")??;
+    Ok(())
+}
+/// An attached frontend may not own the worker as a child. The worker retains this directory lock
+/// for its entire main task, so lock acquisition confirms shutdown without signaling an unowned PID.
+
+async fn wait_workspace_release(data_dir: &Path) -> Result<()> {
+    let lock_path = data_dir.join(".lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open workspace lock {}", lock_path.display()))?;
+    let display = data_dir.display().to_string();
+    tokio::task::spawn_blocking(move || {
+        lock.lock()
+            .with_context(|| format!("wait for workspace exit {display}"))
+    })
+    .await
+    .context("Workspace exit waiter stopped")??;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1649,7 +1995,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attachment_is_exclusive_and_old_input_is_fenced() {
+    async fn unexpected_client_eof_finishes_worker_and_fences_reattachment() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temporary.path().join("vault")).unwrap();
+        let mut workspace = Workspace::bind(directory.path()).unwrap();
+        let endpoint = endpoint_for(&fs::canonicalize(directory.path()).unwrap()).unwrap();
+        let client = raw_attach(&endpoint).await.unwrap();
+        assert!(matches!(
+            workspace.next_event().await,
+            Some(WorkspaceEvent::Attached(80, 24))
+        ));
+
+        drop(client);
+        assert!(
+            timeout(Duration::from_secs(3), workspace.next_event())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!workspace.is_attached());
+
+        let mut retry = UnixStream::connect(&endpoint).await.unwrap();
+        verify_peer(&retry).unwrap();
+        write_frame(&mut retry, KIND_HELLO, &encode_dimensions(80, 24))
+            .await
+            .unwrap();
+        let refusal = read_frame(&mut retry, MAX_CONTROL_PAYLOAD)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refusal.kind, KIND_REFUSED);
+
+        workspace.finish(None).await.unwrap();
+        assert!(!endpoint.exists());
+    }
+
+    #[tokio::test]
+    async fn frontend_shutdown_is_confirmed_before_transport_closes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temporary.path().join("vault")).unwrap();
+        let mut workspace = Workspace::bind(directory.path()).unwrap();
+        let endpoint = endpoint_for(&fs::canonicalize(directory.path()).unwrap()).unwrap();
+        let mut client = raw_attach(&endpoint).await.unwrap();
+        assert!(matches!(
+            workspace.next_event().await,
+            Some(WorkspaceEvent::Attached(80, 24))
+        ));
+
+        write_frame(&mut client, KIND_CLIENT_SHUTDOWN, &[])
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_secs(3), workspace.next_event())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        workspace.finish(None).await.unwrap();
+
+        let finished = read_frame(&mut client, MAX_CONTROL_PAYLOAD)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished.kind, KIND_FINISHED);
+        assert_eq!(decode_finish(&finished.payload).unwrap(), None);
+        assert!(
+            timeout(
+                Duration::from_secs(3),
+                read_frame(&mut client, MAX_CONTROL_PAYLOAD)
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+        );
+        assert!(!endpoint.exists());
+    }
+
+    #[tokio::test]
+    async fn explicit_workspace_detach_allows_reattachment_and_fences_old_input() {
         let temporary = tempfile::tempdir().unwrap();
         let directory = Directory::open(temporary.path().join("vault")).unwrap();
         let mut workspace = Workspace::bind(directory.path()).unwrap();
@@ -1673,6 +2097,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(refusal.kind, KIND_REFUSED);
+        // An abandoned client's queued connection must not run after reattachment.
+        let old_attachment = workspace.shared.lock().current.as_ref().unwrap().id;
+        assert!(workspace.shared.submit_event(
+            old_attachment,
+            WorkspaceEvent::Connect("discarded destination".to_owned()),
+        ).await);
 
         let stale = Event::Resize(90, 30);
         let stale_payload = serde_json::to_vec(&stale).unwrap();
@@ -1685,6 +2115,12 @@ mod tests {
             workspace.next_event().await,
             Some(WorkspaceEvent::Detached)
         ));
+        let detached = read_frame(&mut first, MAX_CONTROL_PAYLOAD)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detached.kind, KIND_DETACHED);
+        assert!(detached.payload.is_empty());
 
         let mut replacement = None;
         for _ in 0..20 {
@@ -1765,6 +2201,118 @@ mod tests {
                 if key.code == crossterm::event::KeyCode::Char(char::from(b'A' + index % 26))));
         }
         assert!(workspace.is_attached());
+        workspace.finish(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authentication_completion_fences_locked_burst_and_preserves_control_events() {
+        use crate::{
+            screen::{Screen, ScreenEvent},
+            settings::Motion,
+            shortcuts::Bindings,
+            theme::default_theme,
+            ui::lock::{UnlockOptions, UnlockRequest, unlock},
+            vault::Secret,
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temporary.path().join("vault")).unwrap();
+        let store = directory.create(Secret::new("authentication boundary passphrase")).await.unwrap();
+        let workspace = Workspace::bind(directory.path()).unwrap();
+        let shared = Arc::clone(&workspace.shared);
+        let endpoint = endpoint_for(&fs::canonicalize(directory.path()).unwrap()).unwrap();
+        let _client = raw_attach(&endpoint).await.unwrap();
+        let mut screen = Screen::open(workspace).unwrap();
+        assert!(matches!(screen.next_event().await.unwrap(),
+            Some(ScreenEvent::Input(Event::Resize(80, 24)))));
+        let attachment = shared.lock().current.as_ref().unwrap().id;
+        for event in [
+            Event::Paste("authentication boundary passphrase".into()),
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        ] {
+            assert!(shared.submit_event(attachment, WorkspaceEvent::Input(event)).await);
+        }
+        let bindings = Bindings::default();
+        let outcome = unlock(
+            &mut screen, &bindings, &default_theme().palette,
+            UnlockOptions {
+                title: "Vault locked", description: "Retained SSH session",
+                live_sessions: 1, confirm_quit: true, allow_recovery: true, motion: Motion::Off,
+            },
+            |request| async {
+                let UnlockRequest::Passphrase(passphrase) = request else { panic!("password method"); };
+                store.verify_passphrase(passphrase).await?;
+                // These arrive in the same poll that completes verification. They must
+                // never become input to the retained, terminal-focused workspace.
+                for event in [
+                    Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+                    Event::Paste("locked-secret-burst".into()),
+                    Event::Resize(100, 32),
+                ] {
+                    assert!(shared.submit_event(attachment, WorkspaceEvent::Input(event)).await);
+                }
+                assert!(shared.submit_event(attachment, WorkspaceEvent::Connect("retained destination".into())).await);
+                Ok(())
+            },
+        ).await.unwrap().unwrap();
+        assert!(!outcome.recovered);
+        assert!(matches!(screen.next_event().await.unwrap(),
+            Some(ScreenEvent::Input(Event::Resize(100, 32)))));
+        assert!(matches!(screen.next_event().await.unwrap(), Some(ScreenEvent::ConnectRequested)));
+        assert_eq!(screen.take_connect_request().as_deref(), Some("retained destination"));
+        assert!(shared.submit_event(attachment, WorkspaceEvent::Input(Event::Paste("unlocked command".into()))).await);
+        assert!(matches!(screen.next_event().await.unwrap(),
+            Some(ScreenEvent::Input(Event::Paste(text))) if text == "unlocked command"));
+        shared.detach_current();
+        assert!(matches!(screen.next_event().await.unwrap(),
+            Some(ScreenEvent::Input(Event::FocusLost))));
+        screen.finish(None).await.unwrap();
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authentication_fence_covers_blocked_senders_without_losing_lifecycle() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use std::task::Poll;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temporary.path().join("vault")).unwrap();
+        let mut workspace = Workspace::bind(directory.path()).unwrap();
+        let endpoint = endpoint_for(&fs::canonicalize(directory.path()).unwrap()).unwrap();
+        let _client = raw_attach(&endpoint).await.unwrap();
+        assert!(matches!(workspace.next_event().await, Some(WorkspaceEvent::Attached(..))));
+        let shared = Arc::clone(&workspace.shared);
+        let attachment = shared.lock().current.as_ref().unwrap().id;
+        let burst = [
+            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            Event::Paste("queued locked secret".into()),
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 40, row: 4, modifiers: KeyModifiers::NONE,
+            }),
+        ];
+        for index in 0..EVENT_QUEUE_CAPACITY - 1 {
+            assert!(shared.submit_event(attachment, WorkspaceEvent::Input(burst[index % burst.len()].clone())).await);
+        }
+        assert!(shared.submit_event(attachment, WorkspaceEvent::Input(Event::FocusLost)).await);
+        let blocked = shared.submit_event(attachment, WorkspaceEvent::Input(Event::Paste("blocked locked secret".into())));
+        tokio::pin!(blocked);
+        assert!(matches!(futures_util::poll!(&mut blocked), Poll::Pending));
+        workspace.fence_authentication_input();
+        let (sent, event) = tokio::join!(&mut blocked, workspace.next_event());
+        assert!(sent);
+        assert!(matches!(event, Some(WorkspaceEvent::Input(Event::FocusLost))));
+        assert!(shared.submit_event(attachment, WorkspaceEvent::Input(Event::Paste("fresh command".into()))).await);
+        assert!(matches!(workspace.next_event().await,
+            Some(WorkspaceEvent::Input(Event::Paste(text))) if text == "fresh command"));
+
+        shared.detach_current();
+        workspace.fence_authentication_input();
+        assert!(matches!(workspace.next_event().await, Some(WorkspaceEvent::Detached)));
+        shared.mark_finished();
+        workspace.fence_authentication_input();
+        assert!(workspace.next_event().await.is_none());
         workspace.finish(None).await.unwrap();
     }
 
