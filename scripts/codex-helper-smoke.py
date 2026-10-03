@@ -37,7 +37,10 @@ async def smoke(binary):
         (Path(state) / "read-proof").write_text("explicit smoke fixture; no account material")
         result = subprocess.run(command(binary, state, "--vyx-capabilities"), env={},
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, check=True, timeout=15)
+                                stderr=subprocess.PIPE, timeout=15)
+        if result.returncode != 0:
+            detail = result.stderr[-2000:].decode(errors="replace").strip()
+            raise RuntimeError(f"confined helper exited with status {result.returncode}: {detail}")
         assert len(result.stdout) <= 4096 and json.loads(result.stdout) == EXPECTED
         process = await asyncio.create_subprocess_exec(
             *command(binary, state, "app-server"), env={}, stdin=asyncio.subprocess.PIPE,

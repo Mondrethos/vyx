@@ -237,6 +237,11 @@ jobs:
           python3 scripts/build-codex-helper.py --native \
             --work-dir "${RUNNER_TEMP}/codex-helper" --output dist --jobs 2
 
+      - name: Allow bubblewrap user namespaces
+        # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor, and the
+        # smoke confines the helper with bubblewrap exactly as Vyx does.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Exercise isolated helper without an account or network
         run: python3 scripts/codex-helper-smoke.py "dist/vyx-codex-${{ matrix.target }}"
 
